@@ -46,6 +46,7 @@ stages:
               set -x
               # Diagnostic: Exhaustive check of the workspace
               git log -1 --oneline
+              df -h
               ls -la modules/logging/
               cat modules/logging/main.tf
               cat backend.tf
