@@ -44,8 +44,10 @@ stages:
 
           - script: |
               # Diagnostic: Check what code the agent actually has
+              set +e
               git log -1 --oneline
-              cat modules/logging/main.tf
+              head -n 50 modules/logging/main.tf
+              set -e
               
               # Force cleanup of stale state
               rm -rf .terraform .terraform.lock.hcl
