@@ -1,162 +1,154 @@
 # azure-pipelines-infra.yml
-trigger: none
+# Full DevSecOps Pipeline for Infrastructure & Governance
 
-resources:
-  pipelines:
-    - pipeline: backend
-      source: backend-pipeline
-      trigger:
-        branches: [main, release/*, v*]
-    - pipeline: frontend
-      source: frontend-pipeline
-      trigger:
-        branches: [main, release/*, v*]
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/*
+      - k8s/kyverno/*
+      - ansible/*
 
 variables:
   - group: "aws-credentials"
-  - name: isMain
-    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
-  - name: isRelease
-    value: $[startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')]
-  - name: isTag
-    value: $[startsWith(variables['Build.SourceBranch'], 'refs/tags/v')]
+  - name: awsRegion
+    value: "us-east-2"
+  - name: clusterName
+    value: "capstone-project"
 
 stages:
-  - stage: KyvernoOps
-    displayName: "Kyverno Setup"
-    condition: or(always(), contains(variables['Build.SourceBranch'], 'kyverno/'))
+  # ==========================================
+  # Stage 1: IaC Security & Provisioning
+  # ==========================================
+  - stage: Infrastructure
+    displayName: "Terraform & IaC Security"
     jobs:
-      - job: Kyverno
+      - job: Terraform_Plan_Apply
+        displayName: "SCA, Plan & Apply"
+        pool:
+          name: Default
         steps:
-          - template: devops/templates/aws-ecr-login.yml
-            parameters:
-              awsServiceConnection: "aws-service-connection"
-          - template: devops/templates/kyverno-ops.yml
-            parameters:
-              action: "apply"
+          - script: |
+              mkdir -p ~/bin
+              export PATH=$PATH:~/bin
+              if ! command -v trivy &> /dev/null; then
+                echo "Trivy not found in path, downloading to ~/bin..."
+                wget -q https://github.com/aquasecurity/trivy/releases/download/v0.49.1/trivy_0.49.1_Linux-64bit.tar.gz
+                tar zxvf trivy_0.49.1_Linux-64bit.tar.gz -C ~/bin/ trivy
+                rm trivy_0.49.1_Linux-64bit.tar.gz
+              fi
+              trivy config terraform/
+            displayName: "IaC Security Scan (Trivy)"
 
-  - stage: DeployDev
-    displayName: "Deploy to Dev"
-    condition: and(succeeded(), eq(variables['isMain'], 'true'))
+          - script: |
+              # Force cleanup and explicitly clear dynamodb_table to resolve checksum mismatch
+              rm -rf .terraform .terraform.lock.hcl
+              terraform init -input=false -reconfigure -no-color \
+                -backend-config="bucket=capstone-tf-state-1770806700" \
+                -backend-config="key=final-project/terraform.tfstate" \
+                -backend-config="region=$(awsRegion)" \
+                -backend-config="dynamodb_table=" 
+            displayName: "Terraform Init"
+            workingDirectory: "terraform"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          - script: |
+              terraform validate -no-color
+            displayName: "Terraform Validate"
+            workingDirectory: "terraform"
+
+          - script: |
+              # Lock feature disabled at backend level
+              terraform plan -input=false -out=tfplan -no-color 2>&1
+            displayName: "Terraform Plan"
+            workingDirectory: "terraform"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              # Set region environment variable just in case provider doesn't pick up the tf var
+              AWS_DEFAULT_REGION: $(awsRegion)
+
+          - script: |
+              terraform apply -auto-approve tfplan
+            displayName: "Terraform Apply"
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            workingDirectory: "terraform"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+  # ==========================================
+  # Stage 2: Governance (Kyverno)
+  # ==========================================
+  - stage: Governance
+    displayName: "Kyverno Policy Enforcement"
+    dependsOn: Infrastructure
     jobs:
-      - deployment: Deploy
-        environment: "dev"
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - download: backend
-                  artifact: backend-image
-                - download: frontend
-                  artifact: frontend-image
+      - job: Setup_Kyverno
+        displayName: "Install Kyverno & Apply Policies"
+        pool:
+          name: Default
+        steps:
+          - script: |
+              aws eks update-kubeconfig --name $(clusterName) --region $(awsRegion)
+            displayName: "Update Kubeconfig"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
 
-                - script: |
-                    BACKEND_IMAGE=$(cat $(Pipeline.Workspace)/backend/backend-image/image-info.json | jq -r .image)
-                    FRONTEND_IMAGE=$(cat $(Pipeline.Workspace)/frontend/frontend-image/image-info.json | jq -r .image)
-                    echo "##vso[task.setvariable variable=BACKEND_IMAGE]$BACKEND_IMAGE"
-                    echo "##vso[task.setvariable variable=FRONTEND_IMAGE]$FRONTEND_IMAGE"
-                  displayName: "Parse Image Refs"
+          - script: |
+              helm repo add kyverno https://kyverno.github.io/kyverno/
+              helm repo update
+              helm upgrade --install kyverno kyverno/kyverno \
+                -n kyverno --create-namespace \
+                --set admissionController.replicas=1 \
+                --set backgroundController.replicas=1 \
+                --set cleanupController.replicas=1 \
+                --set reportsController.replicas=1 \
+                --wait --timeout 15m
+              kubectl get pods -n kyverno
+            displayName: "Install/Upgrade Kyverno"
 
-                - template: devops/templates/k8s-deploy.yml
-                  parameters:
-                    awsServiceConnection: "aws-service-connection"
-                    clusterName: "capstone-project"
-                    namespace: "dev"
-                    manifestPath: "k8s/dev/"
-                    deploymentName: "backend"
-                    containerName: "fastapi"
-                    imageRef: $(BACKEND_IMAGE)
+          - script: |
+              # Apply production-ready policies (non-root, resource limits, image verification)
+              kubectl apply -f k8s/kyverno/policies/
+            displayName: "Apply Kyverno Cluster Policies"
 
-                - template: devops/templates/k8s-deploy.yml
-                  parameters:
-                    awsServiceConnection: "aws-service-connection"
-                    clusterName: "capstone-project"
-                    namespace: "dev"
-                    manifestPath: "k8s/dev/"
-                    deploymentName: "frontend"
-                    containerName: "react"
-                    imageRef: $(FRONTEND_IMAGE)
-
-  - stage: DeployStaging
-    displayName: "Deploy to Staging"
-    condition: and(succeeded(), eq(variables['isRelease'], 'true'))
+  # ==========================================
+  # Stage 3: Secrets Management (Vault)
+  # ==========================================
+  - stage: Vault_Setup
+    displayName: "Vault Integration"
+    dependsOn: Infrastructure
     jobs:
-      - deployment: Deploy
-        environment: "staging"
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - download: backend
-                  artifact: backend-image
-                - download: frontend
-                  artifact: frontend-image
+      - job: Vault_Injector
+        displayName: "Install Vault Agent Injector"
+        pool:
+          name: Default
+        steps:
+          - script: |
+              aws eks update-kubeconfig --name $(clusterName) --region $(awsRegion)
+            displayName: "Update Kubeconfig"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
 
-                - script: |
-                    BACKEND_IMAGE=$(cat $(Pipeline.Workspace)/backend/backend-image/image-info.json | jq -r .image)
-                    FRONTEND_IMAGE=$(cat $(Pipeline.Workspace)/frontend/frontend-image/image-info.json | jq -r .image)
-                    echo "##vso[task.setvariable variable=BACKEND_IMAGE]$BACKEND_IMAGE"
-                    echo "##vso[task.setvariable variable=FRONTEND_IMAGE]$FRONTEND_IMAGE"
-                  displayName: "Parse Image Refs"
-
-                - template: devops/templates/k8s-deploy.yml
-                  parameters:
-                    awsServiceConnection: "aws-service-connection"
-                    clusterName: "capstone-project"
-                    namespace: "staging"
-                    manifestPath: "k8s/staging/"
-                    deploymentName: "backend"
-                    containerName: "fastapi"
-                    imageRef: $(BACKEND_IMAGE)
-
-                - template: devops/templates/k8s-deploy.yml
-                  parameters:
-                    awsServiceConnection: "aws-service-connection"
-                    clusterName: "capstone-project"
-                    namespace: "staging"
-                    manifestPath: "k8s/staging/"
-                    deploymentName: "frontend"
-                    containerName: "react"
-                    imageRef: $(FRONTEND_IMAGE)
-
-  - stage: DeployProd
-    displayName: "Deploy to Prod"
-    condition: and(succeeded(), eq(variables['isTag'], 'true'))
-    jobs:
-      - deployment: Deploy
-        environment: "prod"
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - download: backend
-                  artifact: backend-image
-                - download: frontend
-                  artifact: frontend-image
-
-                - script: |
-                    BACKEND_IMAGE=$(cat $(Pipeline.Workspace)/backend/backend-image/image-info.json | jq -r .image)
-                    FRONTEND_IMAGE=$(cat $(Pipeline.Workspace)/frontend/frontend-image/image-info.json | jq -r .image)
-                    echo "##vso[task.setvariable variable=BACKEND_IMAGE]$BACKEND_IMAGE"
-                    echo "##vso[task.setvariable variable=FRONTEND_IMAGE]$FRONTEND_IMAGE"
-                  displayName: "Parse Image Refs"
-
-                - template: devops/templates/k8s-deploy.yml
-                  parameters:
-                    awsServiceConnection: "aws-service-connection"
-                    clusterName: "capstone-project"
-                    namespace: "prod"
-                    manifestPath: "k8s/prod/"
-                    deploymentName: "backend"
-                    containerName: "fastapi"
-                    imageRef: $(BACKEND_IMAGE)
-
-                - template: devops/templates/k8s-deploy.yml
-                  parameters:
-                    awsServiceConnection: "aws-service-connection"
-                    clusterName: "capstone-project"
-                    namespace: "prod"
-                    manifestPath: "k8s/prod/"
-                    deploymentName: "frontend"
-                    containerName: "react"
-                    imageRef: $(FRONTEND_IMAGE)
+          - script: |
+              helm repo add hashicorp https://helm.releases.hashicorp.com
+              helm repo update
+              # Assuming Vault Public IP is retrieved from TF output or variable
+              VAULT_IP=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=vault-instance" --query "Reservations[].Instances[].PublicIpAddress" --output text)
+              helm upgrade --install vault hashicorp/vault \
+                --set "injector.externalVaultAddr=http://$VAULT_IP:8200" \
+                -n vault --create-namespace
+            displayName: "Install Vault Agent Injector"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
