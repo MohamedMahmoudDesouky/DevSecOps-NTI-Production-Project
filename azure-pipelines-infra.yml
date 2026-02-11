@@ -43,14 +43,17 @@ stages:
             displayName: "IaC Security Scan (Trivy)"
 
           - script: |
-              # Force cleanup and explicitly clear dynamodb_table to resolve checksum mismatch
+              # Diagnostic: Check what code the agent actually has
+              git log -1 --oneline
+              cat modules/logging/main.tf
+              
+              # Force cleanup of stale state
               rm -rf .terraform .terraform.lock.hcl
               terraform init -input=false -reconfigure -no-color \
                 -backend-config="bucket=capstone-tf-state-1770806700" \
                 -backend-config="key=final-project/terraform.tfstate" \
-                -backend-config="region=$(awsRegion)" \
-                -backend-config="dynamodb_table=" 
-            displayName: "Terraform Init"
+                -backend-config="region=$(awsRegion)" 
+            displayName: "Terraform Init & Diagnostics"
             workingDirectory: "terraform"
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
@@ -62,18 +65,16 @@ stages:
             workingDirectory: "terraform"
 
           - script: |
-              # Lock feature disabled at backend level
               terraform plan -input=false -out=tfplan -no-color 2>&1
             displayName: "Terraform Plan"
             workingDirectory: "terraform"
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              # Set region environment variable just in case provider doesn't pick up the tf var
               AWS_DEFAULT_REGION: $(awsRegion)
 
           - script: |
-              terraform apply -auto-approve tfplan
+              terraform apply -input=false -auto-approve tfplan -no-color
             displayName: "Terraform Apply"
             condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
             workingDirectory: "terraform"
