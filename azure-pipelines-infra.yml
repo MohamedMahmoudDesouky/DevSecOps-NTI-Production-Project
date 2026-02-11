@@ -13,10 +13,19 @@ trigger:
 
 variables:
   - group: "aws-credentials"
+
   - name: awsRegion
     value: "us-east-2"
   - name: clusterName
     value: "capstone-project"
+
+  # Backend settings (kept as variables so they’re easy to change)
+  - name: tfStateBucket
+    value: "capstone-tf-state-1770806700"
+  - name: tfStateKey
+    value: "final-project/terraform.tfstate"
+  - name: tfLockTable
+    value: "terraform-lock"
 
 stages:
   # ==========================================
@@ -30,48 +39,92 @@ stages:
         pool:
           name: Default
         steps:
+          # ------------------------------
+          # IaC Security Scan (Trivy)
+          # ------------------------------
           - script: |
+              set -euxo pipefail
               mkdir -p ~/bin
-              export PATH=$PATH:~/bin
+              export PATH="$PATH:~/bin"
+
               if ! command -v trivy &> /dev/null; then
                 echo "Trivy not found in path, downloading to ~/bin..."
                 wget -q https://github.com/aquasecurity/trivy/releases/download/v0.49.1/trivy_0.49.1_Linux-64bit.tar.gz
                 tar zxvf trivy_0.49.1_Linux-64bit.tar.gz -C ~/bin/ trivy
                 rm trivy_0.49.1_Linux-64bit.tar.gz
               fi
+
+              trivy version
               trivy config terraform/
             displayName: "IaC Security Scan (Trivy)"
 
+          # ------------------------------
+          # Diagnostics + Backend checks + Init
+          # ------------------------------
           - script: |
-              set -x
-              # Diagnostic: Exhaustive check of the workspace
-              git log -1 --oneline
-              df -h
-              ls -la modules/logging/
-              cat modules/logging/main.tf
-              cat backend.tf
-              
-              # Force cleanup of ALL stale state
+              set -euxo pipefail
+
+              echo "== Repo diagnostics =="
+              git log -1 --oneline || true
+              df -h || true
+              ls -la || true
+              ls -la modules/logging/ || true
+              test -f modules/logging/main.tf && sed -n '1,200p' modules/logging/main.tf || true
+              test -f backend.tf && sed -n '1,200p' backend.tf || true
+
+              echo "== Remote backend diagnostics (S3 + DynamoDB) =="
+              aws --version
+              aws s3api head-object \
+                --bucket "$(tfStateBucket)" \
+                --key "$(tfStateKey)" \
+                --region "$(awsRegion)" || true
+
+              aws dynamodb scan \
+                --table-name "$(tfLockTable)" \
+                --region "$(awsRegion)" \
+                --max-items 50 || true
+
+              echo "== Clean local terraform cache =="
               rm -rf .terraform .terraform.lock.hcl
-              
-              # Initialize with explicit lock removal just in case
-              terraform init -input=false -reconfigure -no-color \
-                -backend-config="bucket=capstone-tf-state-1770806700" \
-                -backend-config="key=final-project/terraform.tfstate" \
-                -backend-config="region=$(awsRegion)" 
+
+              echo "== Terraform init (with retry) =="
+              for i in 1 2 3; do
+                echo "Attempt $i/3"
+                if terraform init -input=false -reconfigure -no-color \
+                  -backend-config="bucket=$(tfStateBucket)" \
+                  -backend-config="key=$(tfStateKey)" \
+                  -backend-config="region=$(awsRegion)"; then
+                  break
+                fi
+                echo "terraform init failed. Sleeping 20s then retry..."
+                sleep 20
+              done
             displayName: "Terraform Init & Exhaustive Diagnostics"
             workingDirectory: "terraform"
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
 
+          # ------------------------------
+          # Validate
+          # ------------------------------
           - script: |
+              set -euxo pipefail
               terraform validate -no-color
             displayName: "Terraform Validate"
             workingDirectory: "terraform"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
 
+          # ------------------------------
+          # Plan
+          # ------------------------------
           - script: |
-              terraform plan -input=false -out=tfplan -no-color 2>&1
+              set -euxo pipefail
+              terraform plan -input=false -out=tfplan -no-color
             displayName: "Terraform Plan"
             workingDirectory: "terraform"
             env:
@@ -79,7 +132,11 @@ stages:
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
               AWS_DEFAULT_REGION: $(awsRegion)
 
+          # ------------------------------
+          # Apply (main only)
+          # ------------------------------
           - script: |
+              set -euxo pipefail
               terraform apply -input=false -auto-approve tfplan -no-color
             displayName: "Terraform Apply"
             condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
@@ -87,6 +144,7 @@ stages:
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
 
   # ==========================================
   # Stage 2: Governance (Kyverno)
@@ -101,7 +159,8 @@ stages:
           name: Default
         steps:
           - script: |
-              aws eks update-kubeconfig --name $(clusterName) --region $(awsRegion)
+              set -euxo pipefail
+              aws eks update-kubeconfig --name "$(clusterName)" --region "$(awsRegion)"
             displayName: "Update Kubeconfig"
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
@@ -109,8 +168,10 @@ stages:
               AWS_DEFAULT_REGION: $(awsRegion)
 
           - script: |
+              set -euxo pipefail
               helm repo add kyverno https://kyverno.github.io/kyverno/
               helm repo update
+
               helm upgrade --install kyverno kyverno/kyverno \
                 -n kyverno --create-namespace \
                 --set admissionController.replicas=1 \
@@ -118,11 +179,12 @@ stages:
                 --set cleanupController.replicas=1 \
                 --set reportsController.replicas=1 \
                 --wait --timeout 15m
+
               kubectl get pods -n kyverno
             displayName: "Install/Upgrade Kyverno"
 
           - script: |
-              # Apply production-ready policies (non-root, resource limits, image verification)
+              set -euxo pipefail
               kubectl apply -f k8s/kyverno/policies/
             displayName: "Apply Kyverno Cluster Policies"
 
@@ -139,7 +201,8 @@ stages:
           name: Default
         steps:
           - script: |
-              aws eks update-kubeconfig --name $(clusterName) --region $(awsRegion)
+              set -euxo pipefail
+              aws eks update-kubeconfig --name "$(clusterName)" --region "$(awsRegion)"
             displayName: "Update Kubeconfig"
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
@@ -147,10 +210,18 @@ stages:
               AWS_DEFAULT_REGION: $(awsRegion)
 
           - script: |
+              set -euxo pipefail
               helm repo add hashicorp https://helm.releases.hashicorp.com
               helm repo update
+
               # Assuming Vault Public IP is retrieved from TF output or variable
-              VAULT_IP=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=vault-instance" --query "Reservations[].Instances[].PublicIpAddress" --output text)
+              VAULT_IP=$(aws ec2 describe-instances \
+                --filters "Name=tag:Name,Values=vault-instance" \
+                --query "Reservations[].Instances[].PublicIpAddress" \
+                --output text)
+
+              echo "Vault IP: $VAULT_IP"
+
               helm upgrade --install vault hashicorp/vault \
                 --set "injector.externalVaultAddr=http://$VAULT_IP:8200" \
                 -n vault --create-namespace
