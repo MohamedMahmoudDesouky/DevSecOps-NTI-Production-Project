@@ -43,19 +43,22 @@ stages:
             displayName: "IaC Security Scan (Trivy)"
 
           - script: |
-              # Diagnostic: Check what code the agent actually has
-              set +e
+              set -x
+              # Diagnostic: Exhaustive check of the workspace
               git log -1 --oneline
-              head -n 50 modules/logging/main.tf
-              set -e
+              ls -la modules/logging/
+              cat modules/logging/main.tf
+              cat backend.tf
               
-              # Force cleanup of stale state
+              # Force cleanup of ALL stale state
               rm -rf .terraform .terraform.lock.hcl
+              
+              # Initialize with explicit lock removal just in case
               terraform init -input=false -reconfigure -no-color \
                 -backend-config="bucket=capstone-tf-state-1770806700" \
                 -backend-config="key=final-project/terraform.tfstate" \
                 -backend-config="region=$(awsRegion)" 
-            displayName: "Terraform Init & Diagnostics"
+            displayName: "Terraform Init & Exhaustive Diagnostics"
             workingDirectory: "terraform"
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
