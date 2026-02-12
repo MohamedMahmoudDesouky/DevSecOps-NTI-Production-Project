@@ -41,6 +41,8 @@ variables:
   - name: IMAGE_TAG
     value: $(Build.SourceVersion)
 
+
+
 stages:
   - stage: PRChecks
     displayName: PR Fast Checks
@@ -111,15 +113,36 @@ stages:
               pushLatest: true
               additionalTags: ""
               enableImageScanning: true
+          - script: |
+              set -euo pipefail
+
+              echo "Getting digest for $(ECR_REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)"
+
+              DIGEST="$(aws ecr describe-images \
+                --repository-name "$(IMAGE_NAME)" \
+                --image-ids imageTag="$(IMAGE_TAG)" \
+                --query 'imageDetails[0].imageDigest' \
+                --output text)"
+
+              echo "Digest=$DIGEST"
+              echo "##vso[task.setvariable variable=IMAGE_DIGEST]$DIGEST"
+            displayName: "Get image digest from ECR"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
+
 
           # 5) Keyless cosign sign (must be AFTER push to sign the registry digest)
           - template: pipelines/templates/docker/sign-cosign.yml
             parameters:
               imageName: "$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
+              imageDigest: "$(IMAGE_DIGEST)"   # <-- الجديد
               ecrRegistry: "$(ECR_REGISTRY)"
               signingMethod: keypair
               cosignKey: "$(COSIGN_PRIVATE_KEY_B64)"
+
 
 
 
@@ -206,6 +229,19 @@ stages:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
               AWS_REGION: $(AWS_REGION)
+          - script: |
+              set -euo pipefail
+              echo "Patching manifest image to digest..."
+
+              IMAGE_WITH_DIGEST="$(ECR_REGISTRY)/$(IMAGE_NAME)@$(IMAGE_DIGEST)"
+              echo "IMAGE_WITH_DIGEST=$IMAGE_WITH_DIGEST"
+
+              # استبدال أي image line للصورة بتاعتك
+              sed -i "s#image: .*capstone-project-backend.*#image: ${IMAGE_WITH_DIGEST}#g" k8s/dev-backend/backend-deployment.yaml
+
+              echo "Resulting image line:"
+              grep "image:" -n k8s/dev-backend/backend-deployment.yaml
+            displayName: "Patch manifest to use digest"
 
           # 3) Deploy backend manifests
           - script: |
