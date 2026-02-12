@@ -125,7 +125,8 @@ stages:
                 --output text)"
 
               echo "Digest=$DIGEST"
-              echo "##vso[task.setvariable variable=IMAGE_DIGEST]$DIGEST"
+              echo "##vso[task.setvariable variable=IMAGE_DIGEST;isOutput=true]$DIGEST"
+            name: SetDigest
             displayName: "Get image digest from ECR"
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
@@ -133,15 +134,17 @@ stages:
               AWS_REGION: $(AWS_REGION)
 
 
+
           # 5) Keyless cosign sign (must be AFTER push to sign the registry digest)
           - template: pipelines/templates/docker/sign-cosign.yml
             parameters:
               imageName: "$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
-              imageDigest: "$(IMAGE_DIGEST)"   # <-- الجديد
+              imageDigest: "$(IMAGE_DIGEST)"
               ecrRegistry: "$(ECR_REGISTRY)"
               signingMethod: keypair
               cosignKey: "$(COSIGN_PRIVATE_KEY_B64)"
+
 
 
 
@@ -233,15 +236,23 @@ stages:
               set -euo pipefail
               echo "Patching manifest image to digest..."
 
-              IMAGE_WITH_DIGEST="$(ECR_REGISTRY)/$(IMAGE_NAME)@$(IMAGE_DIGEST)"
+              echo "ECR_REGISTRY=$ECR_REGISTRY"
+              echo "IMAGE_NAME=$IMAGE_NAME"
+              echo "IMAGE_DIGEST=$IMAGE_DIGEST"
+
+              IMAGE_WITH_DIGEST="${ECR_REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}"
               echo "IMAGE_WITH_DIGEST=$IMAGE_WITH_DIGEST"
 
-              # استبدال أي image line للصورة بتاعتك
               sed -i "s#image: .*capstone-project-backend.*#image: ${IMAGE_WITH_DIGEST}#g" k8s/dev-backend/backend-deployment.yaml
 
               echo "Resulting image line:"
               grep "image:" -n k8s/dev-backend/backend-deployment.yaml
             displayName: "Patch manifest to use digest"
+            env:
+              ECR_REGISTRY: $(ECR_REGISTRY)
+              IMAGE_NAME: $(IMAGE_NAME)
+              IMAGE_DIGEST: $(IMAGE_DIGEST)
+
 
           # 3) Deploy backend manifests
           - script: |
