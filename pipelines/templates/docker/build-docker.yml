@@ -28,40 +28,41 @@ parameters:
 
 steps:
   - script: |
-      set -e
+      set -euo pipefail
 
-      echo "Docker version:"
-      docker version || true
+      echo "== OS info =="
+      cat /etc/os-release || true
 
-      echo "Build image: ${{ parameters.imageName }}:${{ parameters.imageTag }}"
-      echo "Dockerfile:  ${{ parameters.dockerfilePath }}"
-      echo "Context:     ${{ parameters.buildContext }}"
-
-      export DOCKER_BUILDKIT=1
-
-      BUILD_ARGS="${{ parameters.buildArgs }}"
-
-      CACHE_ARGS=""
-      if [ "${{ parameters.enableCache }}" = "true" ] || [ "${{ parameters.enableCache }}" = "True" ]; then
-        if [ -n "${{ parameters.cacheRegistry }}" ]; then
-          CACHE_FROM="${{ parameters.cacheRegistry }}/${{ parameters.imageName }}:cache"
-          echo "Cache from: $CACHE_FROM"
-          docker pull "$CACHE_FROM" || true
-          CACHE_ARGS="--cache-from $CACHE_FROM --build-arg BUILDKIT_INLINE_CACHE=1"
+      echo "== Checking required tools (no sudo) =="
+      missing=0
+      for cmd in docker aws curl jq; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+          echo "MISSING: $cmd"
+          missing=1
         else
-          echo "Cache enabled but cacheRegistry is empty - skipping cache-from"
+          echo "OK: $cmd -> $(command -v "$cmd")"
         fi
-      else
-        echo "Cache disabled"
+      done
+
+      if [ "$missing" -ne 0 ]; then
+        echo ""
+        echo "ERROR: Missing required tools on this self-hosted agent."
+        echo "Install them ONCE on the agent host (recommended): docker, awscli, curl, jq."
+        exit 1
       fi
 
-      docker build \
-        -f "${{ parameters.dockerfilePath }}" \
-        -t "${{ parameters.imageName }}:${{ parameters.imageTag }}" \
-        -t "${{ parameters.imageName }}:latest" \
-        $BUILD_ARGS \
-        $CACHE_ARGS \
-        "${{ parameters.buildContext }}"
+      echo ""
+      echo "== Versions =="
+      docker version || true
+      aws --version
+      curl --version | head -n 1
+      jq --version
 
-      echo "Image built successfully."
-    displayName: "Build Docker Image (BuildKit)"
+      echo ""
+      echo "== Docker daemon check =="
+      if ! docker info >/dev/null 2>&1; then
+        echo "ERROR: Docker daemon not reachable."
+        echo "Fix on agent host: start docker + ensure this user is in docker group."
+        exit 1
+      fi
+    displayName: "Prereqs (no sudo): verify docker + aws + curl + jq"
