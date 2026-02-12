@@ -21,7 +21,7 @@ pr:
 
 variables:
   - group: aws-credentials
-
+  - group: cosign-secrets
   - name: AWS_REGION
     value: us-east-2
 
@@ -110,8 +110,9 @@ stages:
               imageName: "$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
               ecrRegistry: "$(ECR_REGISTRY)"
-              signingMethod: keyless
-              rekorUrl: https://rekor.sigstore.dev
+              signingMethod: keypair
+              cosignKey: "$(COSIGN_PRIVATE_KEY)"
+
 
   - stage: DeployDev
     displayName: Deploy to Dev
