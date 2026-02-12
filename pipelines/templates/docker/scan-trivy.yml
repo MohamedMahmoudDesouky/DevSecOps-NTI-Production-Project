@@ -25,7 +25,7 @@ parameters:
   # NEW: path to rego policy (in repo)
   - name: regoPolicyPath
     type: string
-    default: "policies/trivy/ignore-by-age.rego"
+    default: "policies/trivy"
 
 steps:
   - script: |
