@@ -3,8 +3,6 @@
 
 # 🚀 Production-Grade Cloud Architecture
 
-**DevSecOps NTI Production Project**
-
 ---
 
 ## 🏗️ High-Level Architecture Overview
@@ -84,8 +82,7 @@ The system is designed with:
 
 ### Namespaces
 
-* `frontend`
-* `backend`
+* `final-project`
 
 ### Security Controls
 
