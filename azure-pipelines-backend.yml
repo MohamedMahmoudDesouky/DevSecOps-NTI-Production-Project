@@ -15,12 +15,24 @@ pr:
 
 variables:
   - group: "aws-credentials"
-  - name: imageRepository
-    value: "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/capstone-project-backend"
-  - name: EKS_CLUSTER_NAME
-    value: "capstone-project"
+
   - name: AWS_REGION
     value: "us-east-2"
+
+  - name: EKS_CLUSTER_NAME
+    value: "capstone-project"
+
+  # ECR registry base
+  - name: ECR_REGISTRY
+    value: "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
+
+  # Repo name in ECR 
+  - name: IMAGE_NAME
+    value: "capstone-project-backend"
+
+  # Tag: commit SHA
+  - name: IMAGE_TAG
+    value: "$(Build.SourceVersion)"
 
 stages:
   - stage: PRChecks
@@ -28,38 +40,71 @@ stages:
     condition: eq(variables['Build.Reason'], 'PullRequest')
     jobs:
       - job: LintAndTest
+        displayName: "Lint & Test"
+        pool:
+          name: Default
         steps:
           - template: devops/templates/python-pr-checks.yml
 
   - stage: BuildAndPush
-    displayName: "Build, Push and Sign"
+    displayName: "Build, Push, Scan, SBOM, Sign"
     condition: ne(variables['Build.Reason'], 'PullRequest')
     jobs:
       - job: Build
+        displayName: "Docker Build + ECR Push + Security + Sign"
+        pool:
+          name: Default
         steps:
-          - template: devops/templates/aws-ecr-login.yml
+          # 1) Build docker image locally (BuildKit)
+          - template: devops/templates/build-docker.yml
             parameters:
-              awsServiceConnection: "aws-service-connection"
-
-          - template: devops/templates/docker-build-push.yml
-            parameters:
-              imageRepository: $(imageRepository)
-              dockerContext: "backend"
+              imageName: "$(IMAGE_NAME)"
+              imageTag: "$(IMAGE_TAG)"
               dockerfilePath: "backend/Dockerfile"
+              buildContext: "backend"
+              enableCache: true
+              cacheRegistry: "$(ECR_REGISTRY)"
+              buildArgs: {}
 
-          - template: devops/templates/security-scans.yml
+          # 2) Push image to ECR (and tags latest + sha-xxxx)
+          - template: devops/templates/push-ecr.yml
             parameters:
-              imageRepository: $(imageRepository)
-              imageTag: $(Build.SourceVersion)
+              imageName: "$(IMAGE_NAME)"
+              imageTag: "$(IMAGE_TAG)"
+              ecrRegistry: "$(ECR_REGISTRY)"
+              pushLatest: true
+              additionalTags: []
+              enableImageScanning: true
 
-          - template: devops/templates/image-signing.yml
+          # 3) Generate SBOM (Syft) + attach to image
+          - template: devops/templates/sbom-syft.yml
             parameters:
-              imageFullRef: "$(imageRepository):$(Build.SourceVersion)"
+              imageName: "$(ECR_REGISTRY)/$(IMAGE_NAME)"
+              imageTag: "$(IMAGE_TAG)"
+              outputFormats:
+                - "spdx-json"
+                - "cyclonedx-json"
+              attachToImage: true
 
-          - template: devops/templates/publish-image-artifact.yml
+          # 4) Scan with Trivy
+          - template: devops/templates/scan-trivy.yml
             parameters:
-              artifactName: "backend-image"
-              imageRef: "$(imageRepository):$(Build.SourceVersion)"
+              imageName: "$(ECR_REGISTRY)/$(IMAGE_NAME)"
+              imageTag: "$(IMAGE_TAG)"
+              severityThreshold: "CRITICAL,HIGH"
+              failOnVulnerabilities: true
+              ignoreUnfixed: false
+              regoPolicyPath: "policies/trivy"
+
+
+          # 5) Sign with Cosign (keyless)
+          - template: devops/templates/sign-cosign.yml
+            parameters:
+              imageName: "$(IMAGE_NAME)"
+              imageTag: "$(IMAGE_TAG)"
+              ecrRegistry: "$(ECR_REGISTRY)"
+              signingMethod: "keyless"
+              rekorUrl: "https://rekor.sigstore.dev"
 
   - stage: DeployDev
     displayName: "Deploy to Dev"
