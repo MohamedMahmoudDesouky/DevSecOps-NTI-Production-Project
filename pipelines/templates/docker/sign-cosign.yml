@@ -1,72 +1,177 @@
 parameters:
   - name: imageName
     type: string
+
   - name: imageTag
     type: string
     default: "$(Build.BuildNumber)"
+
   - name: ecrRegistry
     type: string
     default: "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
+
   - name: signingMethod
     type: string
     default: "keyless" # 'keyless' or 'keypair'
+
   - name: cosignKey
     type: string
     default: "" # Only needed for keypair method
+
   - name: rekorUrl
     type: string
     default: "https://rekor.sigstore.dev"
-  # NEW (optional): keep issuer configurable
+
+  # keep issuer configurable
   - name: oidcIssuer
     type: string
     default: "https://vstoken.dev.azure.com/selcon"
 
 steps:
-  # 0) Prereqs on CentOS (wget + docker + aws)
+  # 0) Prereqs (no repeated installs): verify + install ONLY if missing
   - script: |
       set -euo pipefail
+
+      echo "COSIGN_TEMPLATE_VERSION=20260212_v1"
 
       echo "== OS info =="
       cat /etc/os-release || true
 
-      echo "== Install prerequisites (wget/curl) =="
-      sudo dnf -y install wget curl
+      # Helper functions
+      have() { command -v "$1" >/dev/null 2>&1; }
+      can_sudo() { sudo -n true >/dev/null 2>&1; }
 
-      echo "== Check docker =="
-      if ! command -v docker >/dev/null 2>&1; then
-        echo "Docker not found. Installing..."
+      echo "== Check required tools =="
+      missing_pkgs=()
+
+      # We only install curl/wget if BOTH missing (we can use either)
+      if have curl; then
+        echo "OK: curl -> $(command -v curl)"
+      else
+        echo "MISSING: curl"
+      fi
+
+      if have wget; then
+        echo "OK: wget -> $(command -v wget)"
+      else
+        echo "MISSING: wget"
+      fi
+
+      if ! have curl && ! have wget; then
+        missing_pkgs+=(curl wget)
+      fi
+
+      if have aws; then
+        echo "OK: aws -> $(command -v aws)"
+      else
+        echo "MISSING: aws"
+        missing_pkgs+=(awscli)
+      fi
+
+      if have docker; then
+        echo "OK: docker -> $(command -v docker)"
+      else
+        echo "MISSING: docker"
+        # We'll install docker below if allowed
+      fi
+
+      if [ "${#missing_pkgs[@]}" -gt 0 ]; then
+        echo "== Install missing packages: ${missing_pkgs[*]} =="
+        if can_sudo; then
+          sudo dnf -y install \
+            --setopt=fastestmirror=True \
+            --setopt=max_parallel_downloads=10 \
+            --setopt=timeout=20 \
+            --setopt=retries=3 \
+            "${missing_pkgs[@]}"
+        else
+          echo "ERROR: Missing packages (${missing_pkgs[*]}) but sudo is not passwordless."
+          exit 1
+        fi
+      else
+        echo "No base packages to install."
+      fi
+
+      echo "== Ensure Docker is available =="
+      if ! have docker; then
+        if ! can_sudo; then
+          echo "ERROR: Docker missing and sudo is not passwordless."
+          exit 1
+        fi
+
+        echo "Installing Docker..."
         sudo dnf -y install dnf-plugins-core
         sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
         sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
       fi
-      sudo systemctl enable --now docker
-      docker version
-      docker info
 
-      echo "== Check aws cli =="
-      if ! command -v aws >/dev/null 2>&1; then
-        sudo dnf -y install awscli
+      echo "== Start Docker daemon (best effort) =="
+      if can_sudo; then
+        sudo systemctl enable --now docker || true
       fi
-      aws --version
-    displayName: "Prereqs (CentOS 10): docker + aws + wget/curl"
 
-  # 1) Install cosign
+      # Validate Docker daemon access
+      docker version || true
+      if ! docker info >/dev/null 2>&1; then
+        echo "ERROR: Docker daemon not reachable."
+        echo "Ensure docker is running and this agent user has permission (docker group)."
+        exit 1
+      fi
+
+      echo "== aws cli version =="
+      aws --version
+    displayName: "Prereqs (CentOS 10): docker + aws + curl/wget (install if missing)"
+    env:
+      AWS_REGION: $(AWS_REGION)
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
+
+  # 1) Install/Verify cosign (no sudo install into workspace; optional sudo copy)
   - script: |
       set -euo pipefail
 
-      echo "##[section]Installing Cosign"
+      echo "##[section]Install/Verify Cosign"
 
-      if ! command -v cosign &> /dev/null; then
-        COSIGN_VERSION="v2.2.2"
-        wget -q "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
-        sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
-        rm -f cosign-linux-amd64
+      have() { command -v "$1" >/dev/null 2>&1; }
+      can_sudo() { sudo -n true >/dev/null 2>&1; }
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      mkdir -p "$BIN_DIR"
+      echo "##vso[task.prependpath]$BIN_DIR"
+
+      COSIGN_BIN="$BIN_DIR/cosign"
+
+      if have cosign; then
+        echo "Cosign already in PATH: $(command -v cosign)"
+        cosign version
+        exit 0
       fi
 
-      cosign version
-    displayName: "Install Cosign"
+      if [ -x "$COSIGN_BIN" ]; then
+        echo "Cosign already present at: $COSIGN_BIN"
+        "$COSIGN_BIN" version
+        exit 0
+      fi
 
-  # 2) Login to ECR (CentOS reliable)
+      COSIGN_VERSION="v2.2.2"
+      URL="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+
+      echo "Downloading cosign ${COSIGN_VERSION}..."
+      if command -v curl >/dev/null 2>&1; then
+        curl -sSfL "$URL" -o "$COSIGN_BIN"
+      else
+        wget -qO "$COSIGN_BIN" "$URL"
+      fi
+      chmod +x "$COSIGN_BIN"
+
+      # Optional: also install system-wide if allowed (not required)
+      if can_sudo; then
+        sudo install -m 0755 "$COSIGN_BIN" /usr/local/bin/cosign || true
+      fi
+
+      "$COSIGN_BIN" version
+    displayName: "Install/Verify Cosign (fast, no rpm)"
+
+  # 2) Login to ECR
   - script: |
       set -euo pipefail
 
@@ -91,6 +196,16 @@ steps:
   - script: |
       set -euo pipefail
 
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      COSIGN_BIN="$BIN_DIR/cosign"
+      if [ ! -x "$COSIGN_BIN" ] && command -v cosign >/dev/null 2>&1; then
+        COSIGN_BIN="$(command -v cosign)"
+      fi
+      if [ ! -x "$COSIGN_BIN" ]; then
+        echo "ERROR: cosign not found"
+        exit 1
+      fi
+
       IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
       ISSUER="${{ parameters.oidcIssuer }}"
 
@@ -101,13 +216,13 @@ steps:
       if [ "${{ parameters.signingMethod }}" = "keyless" ]; then
         export COSIGN_EXPERIMENTAL=1
 
-        cosign sign \
+        "$COSIGN_BIN" sign \
           --yes \
           --oidc-issuer "$ISSUER" \
           --rekor-url "${{ parameters.rekorUrl }}" \
           "$IMAGE_URI"
 
-        echo "##[section]Image signed successfully with keyless method"
+        echo "##[section]Image signed successfully (keyless)"
 
       elif [ "${{ parameters.signingMethod }}" = "keypair" ]; then
         if [ -z "${{ parameters.cosignKey }}" ]; then
@@ -116,14 +231,14 @@ steps:
         fi
 
         echo "${{ parameters.cosignKey }}" > /tmp/cosign.key
-        COSIGN_PASSWORD="" cosign sign \
+        COSIGN_PASSWORD="" "$COSIGN_BIN" sign \
           --yes \
           --key /tmp/cosign.key \
           --rekor-url "${{ parameters.rekorUrl }}" \
           "$IMAGE_URI"
         rm -f /tmp/cosign.key
 
-        echo "##[section]Image signed successfully with keypair method"
+        echo "##[section]Image signed successfully (keypair)"
       else
         echo "##vso[task.logissue type=error]Invalid signing method: ${{ parameters.signingMethod }}"
         exit 1
@@ -133,9 +248,19 @@ steps:
       COSIGN_EXPERIMENTAL: 1
       SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
-  # 4) Verify (FIXED issuer)
+  # 4) Verify
   - script: |
       set -euo pipefail
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      COSIGN_BIN="$BIN_DIR/cosign"
+      if [ ! -x "$COSIGN_BIN" ] && command -v cosign >/dev/null 2>&1; then
+        COSIGN_BIN="$(command -v cosign)"
+      fi
+      if [ ! -x "$COSIGN_BIN" ]; then
+        echo "ERROR: cosign not found"
+        exit 1
+      fi
 
       IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
       ISSUER="${{ parameters.oidcIssuer }}"
@@ -146,7 +271,7 @@ steps:
       if [ "${{ parameters.signingMethod }}" = "keyless" ]; then
         export COSIGN_EXPERIMENTAL=1
 
-        cosign verify \
+        "$COSIGN_BIN" verify \
           --certificate-oidc-issuer "$ISSUER" \
           --rekor-url "${{ parameters.rekorUrl }}" \
           "$IMAGE_URI"
@@ -164,7 +289,18 @@ steps:
   # 5) Tree
   - script: |
       set -euo pipefail
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      COSIGN_BIN="$BIN_DIR/cosign"
+      if [ ! -x "$COSIGN_BIN" ] && command -v cosign >/dev/null 2>&1; then
+        COSIGN_BIN="$(command -v cosign)"
+      fi
+      if [ ! -x "$COSIGN_BIN" ]; then
+        echo "ERROR: cosign not found"
+        exit 1
+      fi
+
       IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
-      cosign tree "$IMAGE_URI" || true
+      "$COSIGN_BIN" tree "$IMAGE_URI" || true
     displayName: "Display Signature Tree"
     condition: succeeded()
