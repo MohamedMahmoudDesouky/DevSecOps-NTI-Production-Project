@@ -66,7 +66,6 @@ stages:
               cacheRegistry: "$(ECR_REGISTRY)"
               buildArgs: ""
 
-
           # 2) Push image to ECR
           - template: pipelines/templates/docker/push-ecr.yml
             parameters:
@@ -77,7 +76,7 @@ stages:
               additionalTags: ""
               enableImageScanning: true
 
-                  # 3) SBOM (Syft)
+          # 3) SBOM (Syft)
           - template: pipelines/templates/docker/sbom-syft.yml
             parameters:
               imageName: "$(ECR_REGISTRY)/$(IMAGE_NAME)"
@@ -85,7 +84,6 @@ stages:
               outputFormats: "spdx-json cyclonedx-json"
               attachToImage: true
               artifactName: "sbom-$(Build.BuildId)"
-
 
           # 4) Trivy scan
           - template: pipelines/templates/docker/scan-trivy.yml
@@ -122,4 +120,3 @@ stages:
               namespace: "dev"
               manifestsPath: "k8s/dev-backend"
               clusterName: "$(EKS_CLUSTER_NAME)"
-
