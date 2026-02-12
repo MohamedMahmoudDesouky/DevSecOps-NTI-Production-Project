@@ -145,7 +145,7 @@ steps:
       # We'll wrap it by evaluating and failing on non-ignored items using `--output json` and jq.
 
       set +e
-      conftest test "$INPUT_DIR" -p "$POLICY" --output json > "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json"
+      conftest test "$INPUT_DIR" -p policies/trivy --output json > "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json"
       RC=$?
       set -e
 
