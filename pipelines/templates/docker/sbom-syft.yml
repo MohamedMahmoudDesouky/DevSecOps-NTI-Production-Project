@@ -1,136 +1,67 @@
 parameters:
   - name: imageName
     type: string
+
   - name: imageTag
     type: string
     default: "$(Build.BuildNumber)"
+
+  # Formats as a space-separated string:
+  # Example: "spdx-json cyclonedx-json"
   - name: outputFormats
-    type: object
-    default:
-      - "spdx-json"
-      - "cyclonedx-json"
+    type: string
+    default: "spdx-json cyclonedx-json"
+
   - name: attachToImage
     type: boolean
-    default: true
-  - name: syftVersion
-    type: string
-    default: "latest"
+    default: false
 
 steps:
-  # 0) Prereqs for CentOS: curl, jq, tar, wget (and docker check)
   - script: |
       set -euo pipefail
 
-      echo "== OS info =="
-      cat /etc/os-release || true
-
-      echo "== Install prerequisites (curl/jq/tar/wget) =="
-      sudo dnf -y install curl jq tar wget
-
-      echo "== Versions =="
-      curl --version | head -n 1
-      jq --version
-      tar --version | head -n 1
-      wget --version | head -n 1
-
-      echo "== Check docker (required to read local images) =="
-      if ! command -v docker >/dev/null 2>&1; then
-        echo "##vso[task.logissue type=error]docker not found. SBOM generation requires docker to access local images."
-        exit 1
-      fi
-      docker version
-    displayName: "Prereqs (CentOS 10): curl + jq + tar + wget (+ docker check)"
-
-  - script: |
-      set -euo pipefail
-
-      echo "##[section]Installing Syft"
-
-      if ! command -v syft &> /dev/null; then
-        if [ "${{ parameters.syftVersion }}" = "latest" ]; then
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-        else
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin "v${{ parameters.syftVersion }}"
-        fi
+      # Install syft if missing
+      if ! command -v syft >/dev/null 2>&1; then
+        echo "Syft not found. Installing..."
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
       fi
 
       syft version
-    displayName: "Install Syft"
+    displayName: "Install/Verify Syft"
 
   - script: |
       set -euo pipefail
 
-      echo "##[section]Generating SBOM for: ${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      FORMATS="${{ parameters.outputFormats }}"
 
-      mkdir -p "$(Build.ArtifactStagingDirectory)/sbom"
+      echo "Generating SBOM for: $IMAGE"
+      echo "Formats: $FORMATS"
 
-      ${{ each format in parameters.outputFormats }}:
-        echo "##[command]Generating SBOM in ${{ format }} format"
+      mkdir -p sbom
 
-        OUTPUT_FILE="$(Build.ArtifactStagingDirectory)/sbom/sbom-${{ format }}.json"
-
-        syft packages \
-          "${{ parameters.imageName }}:${{ parameters.imageTag }}" \
-          --output "${{ format }}=$OUTPUT_FILE"
-
-        echo "SBOM generated: $OUTPUT_FILE"
-
-        if [ "${{ format }}" = "spdx-json" ]; then
-          PACKAGE_COUNT=$(jq '.packages | length' "$OUTPUT_FILE")
-          echo "Total packages in SBOM: $PACKAGE_COUNT"
-          echo "##vso[task.setvariable variable=PackageCount;isOutput=true]$PACKAGE_COUNT"
-        fi
+      for fmt in $FORMATS; do
+        OUT="sbom/sbom.${fmt}.json"
+        echo "-> syft $IMAGE -o $fmt > $OUT"
+        syft "$IMAGE" -o "$fmt" > "$OUT"
       done
 
-      syft packages \
-        "${{ parameters.imageName }}:${{ parameters.imageTag }}" \
-        --output table \
-        > "$(Build.ArtifactStagingDirectory)/sbom/sbom-table.txt"
-
-      echo "##[section]SBOM generation completed"
-      ls -la "$(Build.ArtifactStagingDirectory)/sbom"
-    displayName: "Generate SBOM with Syft"
-    name: GenerateSBOM
-
-  - script: |
-      set -euo pipefail
-
-      if [ "${{ parameters.attachToImage }}" = "True" ]; then
-        echo "##[section]Attaching SBOM to image"
-
-        if ! command -v cosign &> /dev/null; then
-          COSIGN_VERSION="v2.2.2"
-          wget -q "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
-          sudo install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
-          rm -f cosign-linux-amd64
-        fi
-
-        cosign version
-
-        IMAGE_URI="${{ parameters.imageName }}:${{ parameters.imageTag }}"
-
-        cosign attach sbom \
-          --sbom "$(Build.ArtifactStagingDirectory)/sbom/sbom-spdx-json.json" \
-          "$IMAGE_URI"
-
-        echo "SBOM attached to image successfully"
-      else
-        echo "attachToImage=false, skipping cosign attach"
-      fi
-    displayName: "Attach SBOM to Image"
-    condition: succeeded()
+      ls -lah sbom
+    displayName: "Generate SBOM(s) with Syft"
 
   - task: PublishPipelineArtifact@1
-    displayName: "Publish SBOM Artifacts"
+    displayName: "Publish SBOM Artifact"
     inputs:
-      targetPath: "$(Build.ArtifactStagingDirectory)/sbom"
+      targetPath: "sbom"
       artifact: "sbom"
       publishLocation: "pipeline"
-    condition: always()
 
   - script: |
       set -euo pipefail
-      echo "##[section]SBOM Summary"
-      head -n 50 "$(Build.ArtifactStagingDirectory)/sbom/sbom-table.txt" || true
-    displayName: "Display SBOM Summary"
-    condition: always()
+      if [ "${{ parameters.attachToImage }}" = "true" ] || [ "${{ parameters.attachToImage }}" = "True" ]; then
+        echo "attachToImage=true requested, but no registry attachment is implemented in this template."
+        echo "If you want attachment, do it in your signing step (cosign attach sbom) or provide registry creds here."
+      else
+        echo "attachToImage=false (skipping attach)."
+      fi
+    displayName: "Attach SBOM (optional)"
