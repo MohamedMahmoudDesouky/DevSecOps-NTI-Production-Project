@@ -23,19 +23,27 @@ spec:
           export REDIS_PORT="6379"
           {{- end -}}
     spec:
-      serviceAccountName: default # Ensure this matches bound_service_account_names in Vault role
+      serviceAccountName: default
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
+
+      # ✅ مهم جداً عشان Kyverno (متسيبهاش nil)
+      initContainers: []
+
       containers:
         - name: backend
-          image: 067970016113.dkr.ecr.us-east-2.amazonaws.com/capstone-project-backend:latest
-          imagePullPolicy: Always
+          # ✅ لازم digest بدل latest
+          image: 067970016113.dkr.ecr.us-east-2.amazonaws.com/capstone-project-backend@sha256:a3621214bafae9acd8bfd82ddc6b6e697005d2ba485be285d8512f583bd224f6
+          imagePullPolicy: IfNotPresent
+
           command: ["/bin/sh", "-c"]
           args: ["source /vault/secrets/config && python3 app.py"]
+
           ports:
             - containerPort: 5000
+
           resources:
             requests:
               memory: "256Mi"
@@ -43,19 +51,21 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "500m"
+
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
-              drop:
-                - ALL
+              drop: ["ALL"]
             runAsNonRoot: true
             runAsUser: 1000
+
           livenessProbe:
             httpGet:
               path: /health
               port: 5000
             initialDelaySeconds: 20
             periodSeconds: 15
+
           readinessProbe:
             httpGet:
               path: /health
