@@ -14,9 +14,11 @@ parameters:
     type: string
     default: "$(Build.BuildNumber)"
 
+  # Build args as a single CLI string (YAML-safe, template-safe)
+  # Example: "--build-arg FOO=bar --build-arg BAZ=qux"
   - name: buildArgs
-    type: object
-    default: {}
+    type: string
+    default: ""
 
   - name: enableCache
     type: boolean
@@ -74,7 +76,7 @@ EOF
       jq --version
     displayName: "Prereqs (CentOS 10): docker + aws + jq"
 
-  # 1) Login to ECR (more reliable on self-hosted CentOS than Docker@2 login)
+  # 1) Login to ECR
   - script: |
       set -euo pipefail
 
@@ -106,23 +108,18 @@ EOF
 
       export DOCKER_BUILDKIT=1
 
-      # Prepare build arguments
-      BUILD_ARGS=""
-      ${{ each arg in parameters.buildArgs }}:
-        BUILD_ARGS="$BUILD_ARGS --build-arg ${{ arg.key }}=${{ arg.value }}"
-      echo "Build args: ${BUILD_ARGS:-<none>}"
+      BUILD_ARGS="${{ parameters.buildArgs }}"
+      if [ -n "$BUILD_ARGS" ]; then
+        echo "Build args: $BUILD_ARGS"
+      else
+        echo "Build args: <none>"
+      fi
 
-      # Cache configuration
       CACHE_ARGS=""
-      ENABLE_CACHE="${{ parameters.enableCache }}"
-
-      if [ "$ENABLE_CACHE" = "true" ] || [ "$ENABLE_CACHE" = "True" ]; then
+      if [ "${{ parameters.enableCache }}" = "true" ] || [ "${{ parameters.enableCache }}" = "True" ]; then
         CACHE_FROM_IMAGE="${{ parameters.cacheRegistry }}/${{ parameters.imageName }}:cache"
         echo "Cache enabled from: $CACHE_FROM_IMAGE"
-
-        # Try pulling cache image (non-fatal)
         docker pull "$CACHE_FROM_IMAGE" || true
-
         CACHE_ARGS="--cache-from $CACHE_FROM_IMAGE --build-arg BUILDKIT_INLINE_CACHE=1"
       else
         echo "Cache disabled"
