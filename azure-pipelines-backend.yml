@@ -26,7 +26,7 @@ variables:
   - name: ECR_REGISTRY
     value: "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
 
-  # Repo name in ECR 
+  # Repo name in ECR
   - name: IMAGE_NAME
     value: "capstone-project-backend"
 
@@ -56,7 +56,7 @@ stages:
           name: Default
         steps:
           # 1) Build docker image locally (BuildKit)
-          - template: devops/templates/build-docker.yml
+          - template: pipelines/templates/docker/build-docker.yml
             parameters:
               imageName: "$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
@@ -64,30 +64,29 @@ stages:
               buildContext: "backend"
               enableCache: true
               cacheRegistry: "$(ECR_REGISTRY)"
-              buildArgs: {}
+              buildArgs: ""
 
-          # 2) Push image to ECR (and tags latest + sha-xxxx)
-          - template: devops/templates/push-ecr.yml
+
+          # 2) Push image to ECR
+          - template: pipelines/templates/docker/push-ecr.yml
             parameters:
               imageName: "$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
               ecrRegistry: "$(ECR_REGISTRY)"
               pushLatest: true
-              additionalTags: []
+              additionalTags: ""
               enableImageScanning: true
 
-          # 3) Generate SBOM (Syft) + attach to image
-          - template: devops/templates/sbom-syft.yml
+          # 3) SBOM (Syft)
+          - template: pipelines/templates/docker/sbom-syft.yml
             parameters:
               imageName: "$(ECR_REGISTRY)/$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
-              outputFormats:
-                - "spdx-json"
-                - "cyclonedx-json"
+              outputFormats: "spdx-json cyclonedx-json"
               attachToImage: true
 
-          # 4) Scan with Trivy
-          - template: devops/templates/scan-trivy.yml
+          # 4) Trivy scan
+          - template: pipelines/templates/docker/scan-trivy.yml
             parameters:
               imageName: "$(ECR_REGISTRY)/$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
@@ -96,9 +95,8 @@ stages:
               ignoreUnfixed: false
               regoPolicyPath: "policies/trivy"
 
-
-          # 5) Sign with Cosign (keyless)
-          - template: devops/templates/sign-cosign.yml
+          # 5) Cosign sign
+          - template: pipelines/templates/docker/sign-cosign.yml
             parameters:
               imageName: "$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
@@ -111,9 +109,15 @@ stages:
     dependsOn: BuildAndPush
     condition: succeeded()
     jobs:
-      - template: devops/templates/deploy-eks.yml
-        parameters:
-          environment: 'dev'
-          namespace: 'dev'
-          chartPath: 'charts/backend'
-          valuesFile: 'charts/backend/values.yaml'
+      - job: Deploy
+        displayName: "Deploy Backend to Dev"
+        pool:
+          name: Default
+        steps:
+          - template: pipelines/templates/k8s/deploy-eks.yml
+            parameters:
+              environment: "dev"
+              namespace: "dev"
+              manifestsPath: "k8s/dev-backend"
+              clusterName: "$(EKS_CLUSTER_NAME)"
+
