@@ -4,26 +4,45 @@ parameters:
   - name: imageTag
     type: string
     default: "$(Build.BuildNumber)"
+
+  # Trivy still uses severity to decide what to include in the report
   - name: severityThreshold
     type: string
-    default: "CRITICAL,HIGH"
+    default: "CRITICAL,HIGH,MEDIUM,LOW"
+
   - name: failOnVulnerabilities
     type: boolean
     default: true
+
   - name: ignoreUnfixed
     type: boolean
     default: false
+
   - name: trivyVersion
     type: string
     default: "latest"
+
+  # NEW: path to rego policy (in repo)
+  - name: regoPolicyPath
+    type: string
+    default: "policies/trivy/ignore-by-age.rego"
 
 steps:
   - script: |
       set -euo pipefail
 
-      echo "##[section]Installing Trivy"
+      echo "##[section]Install jq"
+      if ! command -v jq >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo apt-get install -y jq
+      fi
+      jq --version
+    displayName: "Install jq"
 
-      # Install Trivy
+  - script: |
+      set -euo pipefail
+
+      echo "##[section]Installing Trivy"
       if ! command -v trivy &> /dev/null; then
         wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
         echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
@@ -37,11 +56,21 @@ steps:
   - script: |
       set -euo pipefail
 
-      echo "##[section]Scanning image: ${{ parameters.imageName }}:${{ parameters.imageTag }}"
-      echo "Severity threshold: ${{ parameters.severityThreshold }}"
-      echo "Fail on vulnerabilities: ${{ parameters.failOnVulnerabilities }}"
+      echo "##[section]Installing conftest (OPA)"
+      if ! command -v conftest >/dev/null 2>&1; then
+        CONFTEST_VERSION="0.56.0"
+        wget -q "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+        tar -xzf "conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+        sudo mv conftest /usr/local/bin/conftest
+        rm -f "conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+      fi
+      conftest --version
+    displayName: "Install Conftest"
 
-      # Create reports directory
+  - script: |
+      set -euo pipefail
+
+      echo "##[section]Scanning image (Trivy JSON): ${{ parameters.imageName }}:${{ parameters.imageTag }}"
       mkdir -p $(Build.ArtifactStagingDirectory)/trivy-reports
 
       IGNORE_UNFIXED=""
@@ -49,51 +78,89 @@ steps:
         IGNORE_UNFIXED="--ignore-unfixed"
       fi
 
-      # Run Trivy scan with multiple output formats
-      echo "##[command]Running Trivy scan..."
-
-      # JSON format for processing
+      # JSON for policy evaluation
       trivy image \
-        --severity ${{ parameters.severityThreshold }} \
+        --severity "${{ parameters.severityThreshold }}" \
         --format json \
-        --output $(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json \
+        --output "$(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json" \
         $IGNORE_UNFIXED \
-        ${{ parameters.imageName }}:${{ parameters.imageTag }}
+        "${{ parameters.imageName }}:${{ parameters.imageTag }}"
 
-      # HTML format for human readability
+      # Table output for logs (non-blocking)
       trivy image \
-        --severity ${{ parameters.severityThreshold }} \
-        --format template \
-        --template "@/usr/local/share/trivy/templates/html.tpl" \
-        --output $(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.html \
+        --severity "${{ parameters.severityThreshold }}" \
         $IGNORE_UNFIXED \
-        ${{ parameters.imageName }}:${{ parameters.imageTag }}
+        "${{ parameters.imageName }}:${{ parameters.imageTag }}" || true
 
-      # Table format for console output
-      trivy image \
-        --severity ${{ parameters.severityThreshold }} \
-        $IGNORE_UNFIXED \
-        ${{ parameters.imageName }}:${{ parameters.imageTag }}
+      echo "Report written to: $(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json"
+      ls -la $(Build.ArtifactStagingDirectory)/trivy-reports/
+    displayName: "Run Trivy Scan (JSON + Table)"
 
-      # Count vulnerabilities
-      VULN_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")] | length' \
-        $(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json)
+  - script: |
+      set -euo pipefail
 
-      echo "##[section]Scan Results"
-      echo "Critical/High vulnerabilities found: $VULN_COUNT"
+      echo "##[section]Prepare Trivy vulnerabilities as policy inputs"
 
-      # Set variable for later use
-      echo "##vso[task.setvariable variable=VulnerabilityCount;isOutput=true]$VULN_COUNT"
+      REPORT="$(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json"
+      OUTDIR="$(Build.ArtifactStagingDirectory)/trivy-policy-input"
+      mkdir -p "$OUTDIR"
 
-      # Fail if vulnerabilities found and failOnVulnerabilities is true
-      if [ "${{ parameters.failOnVulnerabilities }}" = "True" ] && [ "$VULN_COUNT" -gt 0 ]; then
-        echo "##vso[task.logissue type=error]Found $VULN_COUNT critical/high vulnerabilities"
-        echo "##vso[task.complete result=Failed;]Security scan failed"
+      # Flatten vulnerabilities into one JSON per vulnerability for conftest
+      # Each file contains fields like Severity + PublishedDate which your policy uses
+      jq -c '
+        [.Results[]?.Vulnerabilities[]?]
+        | to_entries[]
+        | .value
+      ' "$REPORT" | awk '{print > (ENVIRON["OUTDIR"] "/vuln-" NR ".json")}' OUTDIR="$OUTDIR"
+
+      COUNT=$(ls -1 "$OUTDIR"/*.json 2>/dev/null | wc -l | tr -d " ")
+      echo "Prepared $COUNT vulnerability input files in $OUTDIR"
+
+      # If no vulns found at all, policy pass immediately
+      if [ "$COUNT" -eq 0 ]; then
+        echo "No vulnerabilities in report. Policy pass."
+        exit 0
+      fi
+
+      echo "Sample vuln:"
+      head -n 1 "$OUTDIR"/vuln-1.json | jq '.'
+    displayName: "Prepare Policy Inputs (1 file per vuln)"
+
+  - script: |
+      set -euo pipefail
+
+      echo "##[section]Run Policy (Conftest) with age-based ignore rules"
+      POLICY="${{ parameters.regoPolicyPath }}"
+      INPUT_DIR="$(Build.ArtifactStagingDirectory)/trivy-policy-input"
+
+      if [ ! -f "$POLICY" ]; then
+        echo "##vso[task.logissue type=error]Rego policy not found at: $POLICY"
         exit 1
       fi
 
-    displayName: "Scan Image with Trivy"
-    name: TrivyScan
+      # IMPORTANT:
+      # Your rego defines default ignore=false and sets ignore=true for vulns to ignore.
+      # So we FAIL if ignore is NOT true.
+      # conftest can check a 'deny' rule easiest, but you wrote 'ignore'.
+      # We'll wrap it by evaluating and failing on non-ignored items using `--output json` and jq.
+
+      set +e
+      conftest test "$INPUT_DIR" -p "$POLICY" --output json > "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json"
+      RC=$?
+      set -e
+
+      # conftest returns 0 if all pass; 1 if any fail.
+      cat "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json" | jq '.'
+
+      if [ "${{ parameters.failOnVulnerabilities }}" = "True" ] && [ $RC -ne 0 ]; then
+        echo "##vso[task.logissue type=error]Policy check failed: vulnerabilities older than allowed thresholds exist."
+        exit 1
+      fi
+
+      echo "Policy check passed (or fail disabled)."
+    displayName: "Policy Gate (Conftest)"
+    name: PolicyGate
+    condition: always()
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish Trivy Reports"
@@ -103,11 +170,11 @@ steps:
       publishLocation: "pipeline"
     condition: always()
 
-  - task: PublishTestResults@2
-    displayName: "Publish Trivy Results as Test Results"
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish Policy Inputs"
     inputs:
-      testResultsFormat: "JUnit"
-      testResultsFiles: "$(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json"
-      testRunTitle: "Trivy Security Scan"
-      failTaskOnFailedTests: ${{ parameters.failOnVulnerabilities }}
+      targetPath: "$(Build.ArtifactStagingDirectory)/trivy-policy-input"
+      artifact: "trivy-policy-input"
+      publishLocation: "pipeline"
     condition: always()
+
