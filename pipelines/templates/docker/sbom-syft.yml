@@ -6,8 +6,7 @@ parameters:
     type: string
     default: "$(Build.BuildNumber)"
 
-  # Formats as a space-separated string:
-  # Example: "spdx-json cyclonedx-json"
+  # space-separated formats, e.g. "spdx-json cyclonedx-json"
   - name: outputFormats
     type: string
     default: "spdx-json cyclonedx-json"
@@ -20,17 +19,29 @@ steps:
   - script: |
       set -euo pipefail
 
-      # Install syft if missing
-      if ! command -v syft >/dev/null 2>&1; then
-        echo "Syft not found. Installing..."
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      mkdir -p "$BIN_DIR"
+      echo "##vso[task.prependpath]$BIN_DIR"
+
+      if command -v syft >/dev/null 2>&1; then
+        echo "Syft already installed: $(command -v syft)"
+        syft version
+        exit 0
       fi
 
-      syft version
-    displayName: "Install/Verify Syft"
+      echo "Syft not found. Installing to $BIN_DIR (no sudo)..."
+      curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+        | sh -s -- -b "$BIN_DIR"
+
+      echo "Syft installed:"
+      "$BIN_DIR/syft" version
+    displayName: "Install/Verify Syft (no sudo)"
 
   - script: |
       set -euo pipefail
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      echo "Using syft at: $BIN_DIR/syft"
 
       IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
       FORMATS="${{ parameters.outputFormats }}"
@@ -42,8 +53,8 @@ steps:
 
       for fmt in $FORMATS; do
         OUT="sbom/sbom.${fmt}.json"
-        echo "-> syft $IMAGE -o $fmt > $OUT"
-        syft "$IMAGE" -o "$fmt" > "$OUT"
+        echo "-> $BIN_DIR/syft $IMAGE -o $fmt > $OUT"
+        "$BIN_DIR/syft" "$IMAGE" -o "$fmt" > "$OUT"
       done
 
       ls -lah sbom
@@ -55,13 +66,3 @@ steps:
       targetPath: "sbom"
       artifact: "sbom"
       publishLocation: "pipeline"
-
-  - script: |
-      set -euo pipefail
-      if [ "${{ parameters.attachToImage }}" = "true" ] || [ "${{ parameters.attachToImage }}" = "True" ]; then
-        echo "attachToImage=true requested, but no registry attachment is implemented in this template."
-        echo "If you want attachment, do it in your signing step (cosign attach sbom) or provide registry creds here."
-      else
-        echo "attachToImage=false (skipping attach)."
-      fi
-    displayName: "Attach SBOM (optional)"
