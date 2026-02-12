@@ -24,7 +24,7 @@ steps:
   - script: |
       set -euo pipefail
 
-      echo "SBOM_SYFT_TEMPLATE_VERSION=20260212_SOURCE_v1"
+      echo "SBOM_SYFT_TEMPLATE_VERSION=20260212_SOURCE_v2"
       echo "== Syft availability check =="
 
       WORK_BIN_DIR="$(Pipeline.Workspace)/bin"
@@ -127,25 +127,28 @@ steps:
         exit 1
       fi
 
-      mkdir -p sbom
+      # Write SBOM to Pipeline.Workspace for stability
+      OUT_DIR="$(Pipeline.Workspace)/sbom"
+      mkdir -p "$OUT_DIR"
 
       TARGET="dir:$SRC_ABS"
       echo "Generating SBOM for: $TARGET"
 
       for fmt in $FORMATS; do
-        OUT="sbom/sbom.${fmt}.json"
+        OUT="$OUT_DIR/sbom.${fmt}.json"
         echo "-> $SYFT_BIN $TARGET -o $fmt > $OUT"
         "$SYFT_BIN" "$TARGET" -o "$fmt" > "$OUT"
       done
 
       echo "SBOM outputs:"
-      ls -lah sbom
+      ls -lah "$OUT_DIR"
     displayName: "Generate SBOM(s) from SOURCE with Syft"
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish SBOM Artifact"
+    condition: always()
     inputs:
-      targetPath: "sbom"
+      targetPath: "$(Pipeline.Workspace)/sbom"
       artifact: "${{ parameters.artifactName }}"
       publishLocation: "pipeline"
 
@@ -154,4 +157,4 @@ steps:
       echo "Post-publish flush (keep job alive briefly so ADO logs finalize)"
       sleep 3
     displayName: "Post-publish flush"
-
+    condition: always()
