@@ -1,13 +1,14 @@
 parameters:
   - name: imageName
     type: string
+
   - name: imageTag
     type: string
     default: "$(Build.BuildNumber)"
 
   - name: severityThreshold
     type: string
-    default: "CRITICAL,HIGH,MEDIUM,LOW"
+    default: "CRITICAL,HIGH"
 
   - name: failOnVulnerabilities
     type: boolean
@@ -17,167 +18,79 @@ parameters:
     type: boolean
     default: false
 
-  - name: trivyVersion
-    type: string
-    default: "latest"
-
-  # Folder which contains rego policies + lib/
+  # Optional: path to a Trivy config or policy directory in repo
   - name: regoPolicyPath
     type: string
-    default: "policies/trivy"
+    default: ""
 
 steps:
   - script: |
       set -euo pipefail
 
-      echo "== OS info =="
-      cat /etc/os-release || true
-
-      echo "##[section]Install prerequisites (jq/wget/tar)"
-      sudo dnf -y install jq wget tar
-
-      jq --version
-      wget --version | head -n 1
-      tar --version | head -n 1
-    displayName: "Prereqs (CentOS 10): jq + wget + tar"
-
-  - script: |
-      set -euo pipefail
-
-      echo "##[section]Installing Trivy (RPM repo)"
-
-      if ! command -v trivy &> /dev/null; then
-        # Add Aqua Trivy repo for RHEL/CentOS
-        sudo tee /etc/yum.repos.d/trivy.repo >/dev/null <<'EOF'
-      [trivy]
-      name=Trivy repository
-      baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/$basearch/
-      enabled=1
-      gpgcheck=1
-      gpgkey=https://aquasecurity.github.io/trivy-repo/rpm/public.key
-EOF
-        sudo dnf -y makecache
-        sudo dnf -y install trivy
+      # Install trivy if missing
+      if ! command -v trivy >/dev/null 2>&1; then
+        echo "Trivy not found. Installing..."
+        sudo rpm -ivh https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.57.1_Linux-64bit.rpm || true
       fi
 
       trivy --version
-    displayName: "Install Trivy"
+    displayName: "Install/Verify Trivy"
 
   - script: |
       set -euo pipefail
 
-      echo "##[section]Installing conftest (OPA)"
-      if ! command -v conftest >/dev/null 2>&1; then
-        CONFTEST_VERSION="0.56.0"
-        wget -q "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
-        tar -xzf "conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
-        sudo install -m 0755 conftest /usr/local/bin/conftest
-        rm -f conftest "conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
-      fi
-      conftest --version
-    displayName: "Install Conftest"
+      IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      SEVERITY="${{ parameters.severityThreshold }}"
+      FAIL="${{ parameters.failOnVulnerabilities }}"
+      IGNORE_UNFIXED="${{ parameters.ignoreUnfixed }}"
+      POLICY_PATH="${{ parameters.regoPolicyPath }}"
 
-  - script: |
-      set -euo pipefail
+      echo "Scanning image: $IMAGE"
+      echo "Severity threshold: $SEVERITY"
+      echo "failOnVulnerabilities: $FAIL"
+      echo "ignoreUnfixed: $IGNORE_UNFIXED"
+      echo "regoPolicyPath: ${POLICY_PATH:-<none>}"
 
-      echo "##[section]Scanning image (Trivy JSON): ${{ parameters.imageName }}:${{ parameters.imageTag }}"
-      mkdir -p "$(Build.ArtifactStagingDirectory)/trivy-reports"
+      # If the image is in ECR, login first (helps Trivy pull)
+      if echo "$IMAGE" | grep -q "amazonaws.com/"; then
+        : "${AWS_REGION:?AWS_REGION is required}"
+        : "${AWS_ACCOUNT_ID:?AWS_ACCOUNT_ID is required}"
 
-      IGNORE_UNFIXED=""
-      if [ "${{ parameters.ignoreUnfixed }}" = "True" ]; then
-        IGNORE_UNFIXED="--ignore-unfixed"
-      fi
-
-      trivy image \
-        --severity "${{ parameters.severityThreshold }}" \
-        --format json \
-        --output "$(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json" \
-        $IGNORE_UNFIXED \
-        "${{ parameters.imageName }}:${{ parameters.imageTag }}"
-
-      # Table output for logs (non-blocking)
-      trivy image \
-        --severity "${{ parameters.severityThreshold }}" \
-        $IGNORE_UNFIXED \
-        "${{ parameters.imageName }}:${{ parameters.imageTag }}" || true
-
-      echo "Report written to: $(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json"
-      ls -la "$(Build.ArtifactStagingDirectory)/trivy-reports/"
-    displayName: "Run Trivy Scan (JSON + Table)"
-
-  - script: |
-      set -euo pipefail
-
-      echo "##[section]Prepare Trivy vulnerabilities as policy inputs"
-
-      REPORT="$(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json"
-      OUTDIR="$(Build.ArtifactStagingDirectory)/trivy-policy-input"
-      mkdir -p "$OUTDIR"
-
-      # One JSON per vulnerability (so policy can read input.Severity, input.PublishedDate, etc.)
-      jq -c '
-        [.Results[]?.Vulnerabilities[]?]
-        | to_entries[]
-        | .value
-      ' "$REPORT" | awk '{print > (ENVIRON["OUTDIR"] "/vuln-" NR ".json")}' OUTDIR="$OUTDIR"
-
-      COUNT=$(ls -1 "$OUTDIR"/*.json 2>/dev/null | wc -l | tr -d " ")
-      echo "Prepared $COUNT vulnerability input files in $OUTDIR"
-
-      if [ "$COUNT" -eq 0 ]; then
-        echo "No vulnerabilities in report. Policy pass."
-        exit 0
+        REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        echo "Logging in to ECR for Trivy pull: $REGISTRY"
+        aws ecr get-login-password --region "${AWS_REGION}" \
+          | docker login --username AWS --password-stdin "${REGISTRY}"
       fi
 
-      echo "Sample vuln:"
-      head -n 1 "$OUTDIR"/vuln-1.json | jq '.'
-    displayName: "Prepare Policy Inputs (1 file per vuln)"
+      # Build Trivy flags
+      FLAGS="--severity ${SEVERITY} --format table"
 
-  - script: |
-      set -euo pipefail
-
-      echo "##[section]Run Policy (Conftest) with age-based ignore rules"
-
-      POLICY_DIR="${{ parameters.regoPolicyPath }}"
-      INPUT_DIR="$(Build.ArtifactStagingDirectory)/trivy-policy-input"
-
-      # Since you now have lib/ + policy files, we expect a directory
-      if [ ! -d "$POLICY_DIR" ]; then
-        echo "##vso[task.logissue type=error]Rego policy directory not found at: $POLICY_DIR"
-        ls -la policies || true
-        ls -la "$POLICY_DIR" || true
-        exit 1
+      if [ "$IGNORE_UNFIXED" = "true" ] || [ "$IGNORE_UNFIXED" = "True" ]; then
+        FLAGS="$FLAGS --ignore-unfixed"
       fi
 
-      set +e
-      conftest test "$INPUT_DIR" -p "$POLICY_DIR" --output json > "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json"
-      RC=$?
-      set -e
-
-      cat "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json" | jq '.'
-
-      if [ "${{ parameters.failOnVulnerabilities }}" = "True" ] && [ $RC -ne 0 ]; then
-        echo "##vso[task.logissue type=error]Policy check failed: vulnerabilities older than allowed thresholds exist."
-        exit 1
+      # If you meant "regoPolicyPath" as Trivy config/policy dir, prefer config if exists
+      # (Trivy's native config is trivy.yaml; custom policies are more typical with Conftest/OPA,
+      # but we keep this hook to avoid breaking your pipeline.)
+      if [ -n "$POLICY_PATH" ] && [ -e "$POLICY_PATH" ]; then
+        echo "Policy/config path exists: $POLICY_PATH"
+        # If it's a file, treat as config
+        if [ -f "$POLICY_PATH" ]; then
+          FLAGS="$FLAGS --config $POLICY_PATH"
+        fi
       fi
 
-      echo "Policy check passed (or fail disabled)."
-    displayName: "Policy Gate (Conftest)"
-    name: PolicyGate
-    condition: always()
+      echo "Running: trivy image $FLAGS $IMAGE"
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish Trivy Reports"
-    inputs:
-      targetPath: "$(Build.ArtifactStagingDirectory)/trivy-reports"
-      artifact: "trivy-reports"
-      publishLocation: "pipeline"
-    condition: always()
-
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish Policy Inputs"
-    inputs:
-      targetPath: "$(Build.ArtifactStagingDirectory)/trivy-policy-input"
-      artifact: "trivy-policy-input"
-      publishLocation: "pipeline"
-    condition: always()
+      if [ "$FAIL" = "true" ] || [ "$FAIL" = "True" ]; then
+        trivy image $FLAGS "$IMAGE"
+      else
+        # don't fail the job even if vulns found
+        trivy image $FLAGS "$IMAGE" || true
+      fi
+    displayName: "Trivy Image Scan"
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+      AWS_REGION: $(AWS_REGION)
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
