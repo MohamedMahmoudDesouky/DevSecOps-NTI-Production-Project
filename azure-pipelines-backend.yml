@@ -126,30 +126,105 @@ stages:
   - stage: DeployDev
     displayName: Deploy to Dev
     dependsOn: BuildAndRelease
-    condition: succeeded()
+    condition: and(succeeded('BuildAndRelease'), eq(variables['Build.SourceBranchName'], 'main'))
     jobs:
-      - job: DebugDeployVars
-        displayName: Debug deploy variables
+      - job: Deploy
+        displayName: Deploy Backend to Dev (kubectl apply)
         pool:
           name: Default
+
         steps:
+          - checkout: self
+
+          # 0) Print debug (عشان نتأكد من القيم)
           - script: |
               echo "Build.Reason=$(Build.Reason)"
               echo "Build.SourceBranch=$(Build.SourceBranch)"
               echo "Build.SourceBranchName=$(Build.SourceBranchName)"
-            displayName: "Print branch variables"
+              echo "AWS_REGION=$(AWS_REGION)"
+              echo "EKS_CLUSTER_NAME=$(EKS_CLUSTER_NAME)"
+            displayName: "Debug deploy variables"
 
-      - job: Deploy
-        displayName: Deploy Backend to Dev
-        condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'))
-        pool:
-          name: Default
-        steps:
-          - template: pipelines/templates/k8s/deploy-eks.yml
-            parameters:
-              environment: dev
-              namespace: dev
-              manifestsPath: k8s/dev-backend
-              clusterName: "$(EKS_CLUSTER_NAME)"
+          # 1) Install/Verify kubectl (NO sudo)
+          - script: |
+              set -euo pipefail
+
+              BIN_DIR="$(Pipeline.Workspace)/bin"
+              mkdir -p "$BIN_DIR"
+              echo "##vso[task.prependpath]$BIN_DIR"
+
+              if command -v kubectl >/dev/null 2>&1; then
+                echo "kubectl already exists: $(command -v kubectl)"
+                kubectl version --client=true --output=yaml || true
+                exit 0
+              fi
+
+              if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+                echo "##vso[task.logissue type=error]Need curl or wget to download kubectl (no sudo available)."
+                exit 1
+              fi
+
+              KVER="$(curl -sSfL https://dl.k8s.io/release/stable.txt 2>/dev/null || true)"
+              if [ -z "$KVER" ]; then
+                KVER="v1.29.0"
+              fi
+
+              URL="https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+              OUT="$BIN_DIR/kubectl"
+
+              echo "Downloading kubectl $KVER ..."
+              if command -v curl >/dev/null 2>&1; then
+                curl -sSfL "$URL" -o "$OUT"
+              else
+                wget -qO "$OUT" "$URL"
+              fi
+
+              chmod +x "$OUT"
+              kubectl version --client=true --output=yaml || true
+            displayName: "Install/Verify kubectl (no sudo)"
+
+          # 2) Configure kubeconfig for EKS
+          - script: |
+              set -euo pipefail
+
+              : "${AWS_REGION:?AWS_REGION missing}"
+              : "${EKS_CLUSTER_NAME:?EKS_CLUSTER_NAME missing}"
+
+              aws --version
+              echo "Configuring kubeconfig for cluster: $EKS_CLUSTER_NAME in $AWS_REGION"
+
+              aws eks update-kubeconfig \
+                --name "$EKS_CLUSTER_NAME" \
+                --region "$AWS_REGION"
+
+              echo "Kubeconfig configured"
+              kubectl cluster-info
+              kubectl get nodes -o wide
+            displayName: "aws eks update-kubeconfig"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_REGION: $(AWS_REGION)
+
+          # 3) Deploy backend manifests
+          - script: |
+              set -euo pipefail
+
+              NS="dev"
+              echo "Ensuring namespace: $NS"
+              kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
+
+              echo "Applying backend manifests..."
+              kubectl -n "$NS" apply -f k8s/dev/backend-configmap.yaml
+              kubectl -n "$NS" apply -f k8s/dev/backend-deployment.yaml
+              kubectl -n "$NS" apply -f k8s/dev/backend-service.yaml
+
+              echo "Rollout status..."
+              kubectl -n "$NS" rollout status deploy/backend --timeout=180s || true
+
+              echo "Backend resources:"
+              kubectl -n "$NS" get deploy,po,svc -o wide
+            displayName: "Deploy backend to dev (kubectl apply)"
+
 
 
