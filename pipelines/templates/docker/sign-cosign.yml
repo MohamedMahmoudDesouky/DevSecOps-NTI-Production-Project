@@ -14,125 +14,71 @@ parameters:
     type: string
     default: "keyless" # 'keyless' or 'keypair'
 
+  # For keypair mode: pass BASE64 of cosign.key (single-line)
   - name: cosignKey
     type: string
-    default: "" # Only needed for keypair method
+    default: "" # Only needed for keypair method (expected base64)
 
   - name: rekorUrl
     type: string
     default: "https://rekor.sigstore.dev"
 
-  # keep issuer configurable
+  # keep issuer configurable (used only for keyless)
   - name: oidcIssuer
     type: string
     default: "https://vstoken.dev.azure.com/selcon"
 
 steps:
-  # 0) Prereqs (no repeated installs): verify + install ONLY if missing
+  # 0) Prereqs: VERIFY ONLY (no sudo installs)
   - script: |
       set -euo pipefail
 
-      echo "COSIGN_TEMPLATE_VERSION=20260212_v1"
-
+      echo "COSIGN_TEMPLATE_VERSION=20260212_v2"
       echo "== OS info =="
       cat /etc/os-release || true
 
-      # Helper functions
       have() { command -v "$1" >/dev/null 2>&1; }
-      can_sudo() { sudo -n true >/dev/null 2>&1; }
 
-      echo "== Check required tools =="
-      missing_pkgs=()
-
-      # We only install curl/wget if BOTH missing (we can use either)
-      if have curl; then
-        echo "OK: curl -> $(command -v curl)"
-      else
-        echo "MISSING: curl"
-      fi
-
-      if have wget; then
-        echo "OK: wget -> $(command -v wget)"
-      else
-        echo "MISSING: wget"
-      fi
-
-      if ! have curl && ! have wget; then
-        missing_pkgs+=(curl wget)
-      fi
-
-      if have aws; then
-        echo "OK: aws -> $(command -v aws)"
-      else
-        echo "MISSING: aws"
-        missing_pkgs+=(awscli)
-      fi
-
-      if have docker; then
-        echo "OK: docker -> $(command -v docker)"
-      else
-        echo "MISSING: docker"
-        # We'll install docker below if allowed
-      fi
-
-      if [ "${#missing_pkgs[@]}" -gt 0 ]; then
-        echo "== Install missing packages: ${missing_pkgs[*]} =="
-        if can_sudo; then
-          sudo dnf -y install \
-            --setopt=fastestmirror=True \
-            --setopt=max_parallel_downloads=10 \
-            --setopt=timeout=20 \
-            --setopt=retries=3 \
-            "${missing_pkgs[@]}"
+      echo "== Checking required tools (no sudo) =="
+      missing=0
+      for cmd in aws docker curl wget base64; do
+        if have "$cmd"; then
+          echo "OK: $cmd -> $(command -v "$cmd")"
         else
-          echo "ERROR: Missing packages (${missing_pkgs[*]}) but sudo is not passwordless."
-          exit 1
+          echo "MISSING: $cmd"
+          missing=1
         fi
-      else
-        echo "No base packages to install."
-      fi
+      done
 
-      echo "== Ensure Docker is available =="
-      if ! have docker; then
-        if ! can_sudo; then
-          echo "ERROR: Docker missing and sudo is not passwordless."
-          exit 1
-        fi
-
-        echo "Installing Docker..."
-        sudo dnf -y install dnf-plugins-core
-        sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-        sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-      fi
-
-      echo "== Start Docker daemon (best effort) =="
-      if can_sudo; then
-        sudo systemctl enable --now docker || true
-      fi
-
-      # Validate Docker daemon access
-      docker version || true
-      if ! docker info >/dev/null 2>&1; then
-        echo "ERROR: Docker daemon not reachable."
-        echo "Ensure docker is running and this agent user has permission (docker group)."
+      if [ "$missing" -ne 0 ]; then
+        echo ""
+        echo "ERROR: Missing required tools on this self-hosted agent."
+        echo "Install ONCE on the agent host: awscli, docker, curl or wget, coreutils (base64)."
         exit 1
       fi
 
+      echo ""
+      echo "== Docker daemon check =="
+      docker version || true
+      if ! docker info >/dev/null 2>&1; then
+        echo "ERROR: Docker daemon not reachable."
+        echo "Ensure docker is running and this user is in docker group."
+        exit 1
+      fi
+
+      echo ""
       echo "== aws cli version =="
       aws --version
-    displayName: "Prereqs (CentOS 10): docker + aws + curl/wget (install if missing)"
+    displayName: "Prereqs (no sudo): verify docker + aws + curl/wget + base64"
     env:
       AWS_REGION: $(AWS_REGION)
       AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
 
-  # 1) Install/Verify cosign (no sudo install into workspace; optional sudo copy)
+  # 1) Install/Verify cosign (no sudo; install into workspace)
   - script: |
       set -euo pipefail
 
       echo "##[section]Install/Verify Cosign"
-
-      have() { command -v "$1" >/dev/null 2>&1; }
-      can_sudo() { sudo -n true >/dev/null 2>&1; }
 
       BIN_DIR="$(Pipeline.Workspace)/bin"
       mkdir -p "$BIN_DIR"
@@ -140,7 +86,7 @@ steps:
 
       COSIGN_BIN="$BIN_DIR/cosign"
 
-      if have cosign; then
+      if command -v cosign >/dev/null 2>&1; then
         echo "Cosign already in PATH: $(command -v cosign)"
         cosign version
         exit 0
@@ -162,14 +108,8 @@ steps:
         wget -qO "$COSIGN_BIN" "$URL"
       fi
       chmod +x "$COSIGN_BIN"
-
-      # Optional: also install system-wide if allowed (not required)
-      if can_sudo; then
-        sudo install -m 0755 "$COSIGN_BIN" /usr/local/bin/cosign || true
-      fi
-
       "$COSIGN_BIN" version
-    displayName: "Install/Verify Cosign (fast, no rpm)"
+    displayName: "Install/Verify Cosign (no sudo)"
 
   # 2) Login to ECR
   - script: |
@@ -211,9 +151,9 @@ steps:
 
       echo "##[section]Signing image: $IMAGE_URI"
       echo "Signing method: ${{ parameters.signingMethod }}"
-      echo "OIDC issuer: $ISSUER"
 
       if [ "${{ parameters.signingMethod }}" = "keyless" ]; then
+        echo "OIDC issuer: $ISSUER"
         export COSIGN_EXPERIMENTAL=1
 
         "$COSIGN_BIN" sign \
@@ -227,16 +167,31 @@ steps:
       elif [ "${{ parameters.signingMethod }}" = "keypair" ]; then
         if [ -z "${{ parameters.cosignKey }}" ]; then
           echo "##vso[task.logissue type=error]Cosign key not provided for keypair method"
+          echo "Expected: base64-encoded cosign.key in parameters.cosignKey"
           exit 1
         fi
 
-        echo "${{ parameters.cosignKey }}" > /tmp/cosign.key
-        COSIGN_PASSWORD="" "$COSIGN_BIN" sign \
+        KEY_FILE="$(Pipeline.Workspace)/cosign.key"
+
+        # Decode base64 secret into real PEM file (avoids newline/PEM corruption)
+        printf "%s" "${{ parameters.cosignKey }}" | base64 -d > "$KEY_FILE"
+
+        # Basic validation without exposing key
+        if ! head -n 1 "$KEY_FILE" | grep -q "BEGIN"; then
+          echo "##vso[task.logissue type=error]Decoded key does not look like a valid PEM file (missing BEGIN header)"
+          rm -f "$KEY_FILE" || true
+          exit 1
+        fi
+
+        export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
+
+        "$COSIGN_BIN" sign \
           --yes \
-          --key /tmp/cosign.key \
+          --key "$KEY_FILE" \
           --rekor-url "${{ parameters.rekorUrl }}" \
           "$IMAGE_URI"
-        rm -f /tmp/cosign.key
+
+        rm -f "$KEY_FILE"
 
         echo "##[section]Image signed successfully (keypair)"
       else
@@ -247,6 +202,7 @@ steps:
     env:
       COSIGN_EXPERIMENTAL: 1
       SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      COSIGN_PASSWORD: $(COSIGN_PASSWORD)
 
   # 4) Verify
   - script: |
@@ -266,9 +222,9 @@ steps:
       ISSUER="${{ parameters.oidcIssuer }}"
 
       echo "##[section]Verifying signature"
-      echo "OIDC issuer: $ISSUER"
 
       if [ "${{ parameters.signingMethod }}" = "keyless" ]; then
+        echo "OIDC issuer: $ISSUER"
         export COSIGN_EXPERIMENTAL=1
 
         "$COSIGN_BIN" verify \
@@ -277,10 +233,11 @@ steps:
           "$IMAGE_URI"
 
       elif [ "${{ parameters.signingMethod }}" = "keypair" ]; then
-        echo "Keypair verification requires public key (not implemented in this template)."
+        echo "Keypair verification requires the public key (cosign.pub)."
+        echo "Recommended: commit cosign.pub to repo and add: cosign verify --key cosign.pub $IMAGE_URI"
       fi
 
-      echo "##[section]Signature verified successfully"
+      echo "##[section]Verify step completed"
     displayName: "Verify Signature"
     env:
       COSIGN_EXPERIMENTAL: 1
