@@ -1,21 +1,23 @@
-# Kyverno Helm Values
-# Install with: helm install kyverno kyverno/kyverno -n kyverno --create-namespace -f kyverno-values.yaml
+# kyverno-values.yaml
+# Usage:
+# helm upgrade --install kyverno kyverno/kyverno -n kyverno --create-namespace -f kyverno-values.yaml --wait --timeout 15m
 
-replicaCount: 3
-
-resources:
-  limits:
-    memory: 512Mi
-    cpu: 500m
-  requests:
-    memory: 256Mi
-    cpu: 100m
-
-# Enable policy reports for audit mode
+# Enable policy reports (Audit/reporting)
 policyReports:
   enabled: true
 
-# Background scanning for existing resources
+# Controllers replicas + resources
+
+admissionController:
+  replicas: 3
+  resources:
+    limits:
+      memory: 512Mi
+      cpu: 500m
+    requests:
+      memory: 256Mi
+      cpu: 100m
+
 backgroundController:
   enabled: true
   replicas: 2
@@ -27,7 +29,17 @@ backgroundController:
       memory: 256Mi
       cpu: 100m
 
-# Reports controller for policy reports
+cleanupController:
+  enabled: true
+  replicas: 2
+  resources:
+    limits:
+      memory: 512Mi
+      cpu: 500m
+    requests:
+      memory: 256Mi
+      cpu: 100m
+
 reportsController:
   enabled: true
   replicas: 2
@@ -39,32 +51,24 @@ reportsController:
       memory: 256Mi
       cpu: 100m
 
-# Admission controller configuration
-admissionController:
-  replicas: 3
-  resources:
-    limits:
-      memory: 512Mi
-      cpu: 500m
-    requests:
-      memory: 256Mi
-      cpu: 100m
-
-# Enable metrics for monitoring
+# Metrics (for Prometheus scraping)
 metricsService:
   enabled: true
 
-# Webhook configuration
+# Webhook cleanup job
 webhooksCleanup:
   enabled: true
 
-# Security context
-securityContext:
+# Pod-level security context (applies to kyverno pods themselves)
+podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context (applies to kyverno containers)
+securityContext:
   allowPrivilegeEscalation: false
   capabilities:
     drop:
       - ALL
-  seccompProfile:
-    type: RuntimeDefault
