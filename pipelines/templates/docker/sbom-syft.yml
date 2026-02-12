@@ -15,6 +15,11 @@ parameters:
     type: boolean
     default: false
 
+  # NEW: artifact name (default is unique per stage+job to prevent "already exists")
+  - name: artifactName
+    type: string
+    default: "sbom-$(System.StageName)-$(System.JobName)"
+
 steps:
   - script: |
       set -euo pipefail
@@ -23,25 +28,27 @@ steps:
       mkdir -p "$BIN_DIR"
       echo "##vso[task.prependpath]$BIN_DIR"
 
+      echo "== Syft availability check =="
+
       if command -v syft >/dev/null 2>&1; then
         echo "Syft already installed: $(command -v syft)"
-        syft version
-        exit 0
+        syft version || true
+      else
+        echo "Syft not found. Installing to $BIN_DIR (no sudo)..."
+        # Install script drops 'syft' into BIN_DIR
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b "$BIN_DIR"
+
+        echo "Syft installed:"
+        "$BIN_DIR/syft" version
       fi
 
-      echo "Syft not found. Installing to $BIN_DIR (no sudo)..."
-      curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-        | sh -s -- -b "$BIN_DIR"
-
-      echo "Syft installed:"
-      "$BIN_DIR/syft" version
+      echo "== Effective syft path =="
+      command -v syft
     displayName: "Install/Verify Syft (no sudo)"
 
   - script: |
       set -euo pipefail
-
-      BIN_DIR="$(Pipeline.Workspace)/bin"
-      echo "Using syft at: $BIN_DIR/syft"
 
       IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
       FORMATS="${{ parameters.outputFormats }}"
@@ -51,10 +58,15 @@ steps:
 
       mkdir -p sbom
 
+      # Use syft from PATH (system syft or the one we installed into Pipeline.Workspace/bin)
+      SYFT_BIN="$(command -v syft)"
+      echo "Using syft: $SYFT_BIN"
+      "$SYFT_BIN" version || true
+
       for fmt in $FORMATS; do
         OUT="sbom/sbom.${fmt}.json"
-        echo "-> $BIN_DIR/syft $IMAGE -o $fmt > $OUT"
-        "$BIN_DIR/syft" "$IMAGE" -o "$fmt" > "$OUT"
+        echo "-> $SYFT_BIN $IMAGE -o $fmt > $OUT"
+        "$SYFT_BIN" "$IMAGE" -o "$fmt" > "$OUT"
       done
 
       ls -lah sbom
@@ -64,5 +76,5 @@ steps:
     displayName: "Publish SBOM Artifact"
     inputs:
       targetPath: "sbom"
-      artifact: "sbom"
+      artifact: "${{ parameters.artifactName }}"
       publishLocation: "pipeline"
