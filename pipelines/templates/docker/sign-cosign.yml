@@ -6,6 +6,11 @@ parameters:
     type: string
     default: "$(Build.BuildNumber)"
 
+  # NEW: Image digest (sha256:....). If provided, we'll sign/verify using @digest
+  - name: imageDigest
+    type: string
+    default: ""
+
   - name: ecrRegistry
     type: string
     default: "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
@@ -33,7 +38,7 @@ steps:
   - script: |
       set -euo pipefail
 
-      echo "COSIGN_TEMPLATE_VERSION=20260212_v2"
+      echo "COSIGN_TEMPLATE_VERSION=20260212_v3"
       echo "== OS info =="
       cat /etc/os-release || true
 
@@ -146,11 +151,18 @@ steps:
         exit 1
       fi
 
-      IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      # Use digest if provided; else fall back to :tag
+      if [ -n "${{ parameters.imageDigest }}" ]; then
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}@${{ parameters.imageDigest }}"
+      else
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      fi
+
       ISSUER="${{ parameters.oidcIssuer }}"
 
       echo "##[section]Signing image: $IMAGE_URI"
       echo "Signing method: ${{ parameters.signingMethod }}"
+      echo "Digest provided? $([ -n '${{ parameters.imageDigest }}' ] && echo yes || echo no)"
 
       if [ "${{ parameters.signingMethod }}" = "keyless" ]; then
         echo "OIDC issuer: $ISSUER"
@@ -218,10 +230,16 @@ steps:
         exit 1
       fi
 
-      IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      # Use digest if provided; else fall back to :tag
+      if [ -n "${{ parameters.imageDigest }}" ]; then
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}@${{ parameters.imageDigest }}"
+      else
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      fi
+
       ISSUER="${{ parameters.oidcIssuer }}"
 
-      echo "##[section]Verifying signature"
+      echo "##[section]Verifying signature: $IMAGE_URI"
 
       if [ "${{ parameters.signingMethod }}" = "keyless" ]; then
         echo "OIDC issuer: $ISSUER"
@@ -257,7 +275,13 @@ steps:
         exit 1
       fi
 
-      IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      # Use digest if provided; else fall back to :tag
+      if [ -n "${{ parameters.imageDigest }}" ]; then
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}@${{ parameters.imageDigest }}"
+      else
+        IMAGE_URI="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      fi
+
       "$COSIGN_BIN" tree "$IMAGE_URI" || true
     displayName: "Display Signature Tree"
     condition: succeeded()
