@@ -215,9 +215,9 @@ stages:
               kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
 
               echo "Applying backend manifests..."
-              kubectl -n "$NS" apply -f k8s/dev/backend-configmap.yaml
-              kubectl -n "$NS" apply -f k8s/dev/backend-deployment.yaml
-              kubectl -n "$NS" apply -f k8s/dev/backend-service.yaml
+              kubectl -n "$NS" apply -f k8s/dev-backend/backend-configmap.yaml
+              kubectl -n "$NS" apply -f k8s/dev-backend/backend-deployment.yaml
+              kubectl -n "$NS" apply -f k8s/dev-backend/backend-service.yaml
 
               echo "Rollout status..."
               kubectl -n "$NS" rollout status deploy/backend --timeout=180s || true
