@@ -158,6 +158,33 @@ stages:
         pool:
           name: Default
         steps:
+
+          - script: |
+              set -euxo pipefail
+
+              echo "== Check kyverno release status =="
+              helm -n kyverno status kyverno || true
+              helm -n kyverno history kyverno || true
+
+              # Get release status if exists
+              status="$(helm -n kyverno status kyverno 2>/dev/null | awk -F': ' '/^STATUS:/{print $2}' || true)"
+              echo "Detected STATUS: ${status:-<none>}"
+
+              if [[ "$status" == pending-install || "$status" == pending-upgrade || "$status" == pending-rollback ]]; then
+                echo "Release is pending. Attempting rollback to last successful revision..."
+
+                # Find last deployed revision number (if any)
+                last_deployed="$(helm -n kyverno history kyverno 2>/dev/null | awk '$3=="deployed"{rev=$1} END{print rev}' || true)"
+                if [[ -n "${last_deployed:-}" ]]; then
+                  echo "Rolling back to revision: $last_deployed"
+                  helm -n kyverno rollback kyverno "$last_deployed" --wait --timeout 15m || true
+                else
+                  echo "No deployed revision found. Uninstalling stuck release..."
+                  helm -n kyverno uninstall kyverno || true
+                fi
+              fi
+            displayName: "Fix Helm pending operation (Kyverno)"
+
           - script: |
               set -euxo pipefail
               aws eks update-kubeconfig --name "$(clusterName)" --region "$(awsRegion)"
