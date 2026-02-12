@@ -1,50 +1,29 @@
 parameters:
   - name: imageName
     type: string
+
   - name: imageTag
     type: string
     default: "$(Build.BuildNumber)"
+
   - name: ecrRegistry
     type: string
-    default: "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
-  - name: additionalTags
-    type: object
-    default: []
+
   - name: pushLatest
     type: boolean
     default: true
+
+  # Additional tags as a single space-separated string (YAML-safe)
+  # Example: "sha-1234 build-42"
+  - name: additionalTags
+    type: string
+    default: ""
+
   - name: enableImageScanning
     type: boolean
     default: true
 
 steps:
-  # 0) (Optional) Ensure prerequisites on CentOS (aws + docker)
-  - script: |
-      set -euo pipefail
-
-      echo "== OS info =="
-      cat /etc/os-release || true
-
-      echo "== Check docker =="
-      if ! command -v docker >/dev/null 2>&1; then
-        echo "Docker not found. Installing..."
-        sudo dnf -y install dnf-plugins-core
-        sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-        sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-      fi
-      sudo systemctl enable --now docker
-      docker version
-      docker info
-
-      echo "== Check aws cli =="
-      if ! command -v aws >/dev/null 2>&1; then
-        echo "AWS CLI not found. Installing..."
-        sudo dnf -y install awscli
-      fi
-      aws --version
-    displayName: "Prereqs (CentOS 10): docker + aws"
-
-  # 1) Login to ECR using AWS CLI
   - script: |
       set -euo pipefail
 
@@ -58,7 +37,7 @@ steps:
         | docker login --username AWS --password-stdin "${REGISTRY}"
 
       echo "ECR login OK"
-    displayName: "Login to ECR (aws ecr get-login-password)"
+    displayName: "Login to ECR"
     env:
       AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
       AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
@@ -68,136 +47,48 @@ steps:
   - script: |
       set -euo pipefail
 
-      echo "##[section]Preparing to push image to ECR"
-
+      IMAGE_LOCAL="${{ parameters.imageName }}:${{ parameters.imageTag }}"
       ECR_REPO="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}"
-      LOCAL_IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      ECR_TAG="${{ parameters.imageTag }}"
 
-      echo "Local image: $LOCAL_IMAGE"
-      echo "ECR repository: $ECR_REPO"
+      echo "Local image: $IMAGE_LOCAL"
+      echo "ECR repo:     $ECR_REPO"
+      echo "Tag:          $ECR_TAG"
 
-      aws ecr describe-repositories \
-        --repository-names "${{ parameters.imageName }}" \
-        --region "$(AWS_REGION)" >/dev/null 2>&1 || \
-      aws ecr create-repository \
-        --repository-name "${{ parameters.imageName }}" \
-        --region "$(AWS_REGION)" \
-        --image-scanning-configuration scanOnPush=${{ parameters.enableImageScanning }} \
-        --image-tag-mutability IMMUTABLE >/dev/null
+      # Ensure ECR repository exists (idempotent)
+      if ! aws ecr describe-repositories --repository-names "${{ parameters.imageName }}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+        echo "ECR repo does not exist. Creating: ${{ parameters.imageName }}"
+        aws ecr create-repository --repository-name "${{ parameters.imageName }}" --image-scanning-configuration scanOnPush=${{ parameters.enableImageScanning }} --region "${AWS_REGION}" >/dev/null
+      else
+        echo "ECR repo exists: ${{ parameters.imageName }}"
+      fi
 
-      echo "ECR repository ready"
-    displayName: "Ensure ECR Repository Exists"
+      # Tag & push main tag
+      docker tag "$IMAGE_LOCAL" "${ECR_REPO}:${ECR_TAG}"
+      docker push "${ECR_REPO}:${ECR_TAG}"
+
+      # Optionally tag & push latest
+      if [ "${{ parameters.pushLatest }}" = "true" ] || [ "${{ parameters.pushLatest }}" = "True" ]; then
+        docker tag "$IMAGE_LOCAL" "${ECR_REPO}:latest"
+        docker push "${ECR_REPO}:latest"
+      fi
+
+      # Additional tags (space-separated)
+      EXTRA_TAGS="${{ parameters.additionalTags }}"
+      if [ -n "$EXTRA_TAGS" ]; then
+        echo "Pushing additional tags: $EXTRA_TAGS"
+        for t in $EXTRA_TAGS; do
+          docker tag "$IMAGE_LOCAL" "${ECR_REPO}:${t}"
+          docker push "${ECR_REPO}:${t}"
+        done
+      else
+        echo "No additional tags"
+      fi
+
+      echo "Push complete: ${ECR_REPO}:${ECR_TAG}"
+    displayName: "Tag & Push Image to ECR"
     env:
       AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
       AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
       AWS_REGION: $(AWS_REGION)
-
-  - script: |
-      set -euo pipefail
-
-      ECR_REPO="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}"
-      LOCAL_IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
-
-      echo "##[section]Tagging image for ECR"
-      echo "Local image: $LOCAL_IMAGE"
-
-      PRIMARY_TAG="$ECR_REPO:${{ parameters.imageTag }}"
-      docker tag "$LOCAL_IMAGE" "$PRIMARY_TAG"
-      echo "Tagged: $PRIMARY_TAG"
-
-      COMMIT_SHA="$(echo $(Build.SourceVersion) | cut -c1-7)"
-      COMMIT_TAG="$ECR_REPO:sha-$COMMIT_SHA"
-      docker tag "$LOCAL_IMAGE" "$COMMIT_TAG"
-      echo "Tagged: $COMMIT_TAG"
-
-      if [ "${{ parameters.pushLatest }}" = "True" ]; then
-        LATEST_TAG="$ECR_REPO:latest"
-        docker tag "$LOCAL_IMAGE" "$LATEST_TAG"
-        echo "Tagged: $LATEST_TAG"
-      fi
-
-      ${{ each tag in parameters.additionalTags }}:
-        CUSTOM_TAG="$ECR_REPO:${{ tag }}"
-        docker tag "$LOCAL_IMAGE" "$CUSTOM_TAG"
-        echo "Tagged: $CUSTOM_TAG"
-      done
-    displayName: "Tag Image for ECR"
-
-  - script: |
-      set -euo pipefail
-
-      ECR_REPO="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}"
-
-      echo "##[section]Pushing images to ECR"
-
-      echo "##[command]Pushing $ECR_REPO:${{ parameters.imageTag }}"
-      docker push "$ECR_REPO:${{ parameters.imageTag }}"
-
-      COMMIT_SHA="$(echo $(Build.SourceVersion) | cut -c1-7)"
-      echo "##[command]Pushing $ECR_REPO:sha-$COMMIT_SHA"
-      docker push "$ECR_REPO:sha-$COMMIT_SHA"
-
-      if [ "${{ parameters.pushLatest }}" = "True" ]; then
-        echo "##[command]Pushing $ECR_REPO:latest"
-        docker push "$ECR_REPO:latest"
-      fi
-
-      ${{ each tag in parameters.additionalTags }}:
-        echo "##[command]Pushing $ECR_REPO:${{ tag }}"
-        docker push "$ECR_REPO:${{ tag }}"
-      done
-
-      echo "##[section]All images pushed successfully"
-    displayName: "Push Images to ECR"
-
-  - script: |
-      set -euo pipefail
-
-      ECR_REPO="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}"
-
-      # After push, RepoDigests should exist locally for the ECR-tagged image
-      REF="$(docker inspect --format='{{index .RepoDigests 0}}' "$ECR_REPO:${{ parameters.imageTag }}" || true)"
-
-      if [ -z "$REF" ]; then
-        echo "##vso[task.logissue type=warning]RepoDigest not found locally. Trying docker pull then inspect..."
-        docker pull "$ECR_REPO:${{ parameters.imageTag }}"
-        REF="$(docker inspect --format='{{index .RepoDigests 0}}' "$ECR_REPO:${{ parameters.imageTag }}")"
-      fi
-
-      IMAGE_DIGEST="$(echo "$REF" | cut -d'@' -f2)"
-
-      echo "##[section]Image Push Summary"
-      echo "Repository: $ECR_REPO"
-      echo "Tag: ${{ parameters.imageTag }}"
-      echo "Digest: $IMAGE_DIGEST"
-      echo "Full URI: $ECR_REPO@$IMAGE_DIGEST"
-
-      echo "##vso[task.setvariable variable=ImageDigest;isOutput=true]$IMAGE_DIGEST"
-      echo "##vso[task.setvariable variable=ImageUri;isOutput=true]$ECR_REPO:${{ parameters.imageTag }}"
-      echo "##vso[task.setvariable variable=ImageUriWithDigest;isOutput=true]$ECR_REPO@$IMAGE_DIGEST"
-
-      mkdir -p "$(Build.ArtifactStagingDirectory)/manifests"
-      cat > "$(Build.ArtifactStagingDirectory)/manifests/image-manifest.json" <<EOF
-      {
-        "repository": "$ECR_REPO",
-        "tag": "${{ parameters.imageTag }}",
-        "digest": "$IMAGE_DIGEST",
-        "uri": "$ECR_REPO:${{ parameters.imageTag }}",
-        "uriWithDigest": "$ECR_REPO@$IMAGE_DIGEST",
-        "buildNumber": "$(Build.BuildNumber)",
-        "commitSha": "$(Build.SourceVersion)",
-        "buildDate": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      }
-      EOF
-
-      echo "Manifest created at: $(Build.ArtifactStagingDirectory)/manifests/image-manifest.json"
-      cat "$(Build.ArtifactStagingDirectory)/manifests/image-manifest.json"
-    displayName: "Generate Image Manifest"
-    name: ImageManifest
-
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish Image Manifest"
-    inputs:
-      targetPath: "$(Build.ArtifactStagingDirectory)/manifests"
-      artifact: "image-manifest"
-      publishLocation: "pipeline"
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
