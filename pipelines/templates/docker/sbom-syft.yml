@@ -26,57 +26,53 @@ steps:
 
       BIN_DIR="$(Pipeline.Workspace)/bin"
       mkdir -p "$BIN_DIR"
-
-      # Ensure PATH is updated for THIS step as well
-      export PATH="$BIN_DIR:$PATH"
-      echo "##vso[task.prependpath]$BIN_DIR"
+      SYFT_BIN="$BIN_DIR/syft"
 
       echo "== Syft availability check =="
+      echo "BIN_DIR: $BIN_DIR"
 
-      if command -v syft >/dev/null 2>&1; then
-        echo "Syft already installed: $(command -v syft)"
-        syft version || true
+      # Install only if the binary isn't already present/executable
+      if [ -x "$SYFT_BIN" ]; then
+        echo "Syft already present at: $SYFT_BIN"
+        "$SYFT_BIN" version || true
       else
-        echo "Syft not found. Installing to $BIN_DIR ..."
+        echo "Syft not found at $SYFT_BIN. Installing (no sudo)..."
         curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
           | sh -s -- -b "$BIN_DIR"
 
-        echo "Syft installed at: $BIN_DIR/syft"
-        "$BIN_DIR/syft" version
+        echo "Syft installed at: $SYFT_BIN"
+        ls -lah "$BIN_DIR"
+        "$SYFT_BIN" version
       fi
 
-      echo "== Effective syft path =="
-      command -v syft || { echo "ERROR: syft not found in PATH"; ls -lah "$BIN_DIR"; exit 1; }
-    displayName: "Install/Verify Syft"
+      # Prepend path for future steps (nice-to-have, but we won't depend on it)
+      echo "##vso[task.prependpath]$BIN_DIR"
+
+      echo "== Effective syft binary (absolute path) =="
+      echo "$SYFT_BIN"
+    displayName: "Install/Verify Syft (no sudo)"
 
   - script: |
       set -euo pipefail
 
       BIN_DIR="$(Pipeline.Workspace)/bin"
-      export PATH="$BIN_DIR:$PATH"
+      SYFT_BIN="$BIN_DIR/syft"
+
+      if [ ! -x "$SYFT_BIN" ]; then
+        echo "ERROR: syft binary not found or not executable at $SYFT_BIN"
+        echo "BIN_DIR contents:"
+        ls -lah "$BIN_DIR" || true
+        exit 1
+      fi
 
       IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
       FORMATS="${{ parameters.outputFormats }}"
 
       echo "Generating SBOM for: $IMAGE"
       echo "Formats: $FORMATS"
+      echo "Using syft: $SYFT_BIN"
 
       mkdir -p sbom
-
-      # Robust syft resolution: prefer PATH, fallback to BIN_DIR
-      if command -v syft >/dev/null 2>&1; then
-        SYFT_BIN="$(command -v syft)"
-      elif [ -x "$BIN_DIR/syft" ]; then
-        SYFT_BIN="$BIN_DIR/syft"
-      else
-        echo "ERROR: syft not found"
-        echo "BIN_DIR contents:"
-        ls -lah "$BIN_DIR" || true
-        exit 1
-      fi
-
-      echo "Using syft: $SYFT_BIN"
-      "$SYFT_BIN" version || true
 
       for fmt in $FORMATS; do
         OUT="sbom/sbom.${fmt}.json"
