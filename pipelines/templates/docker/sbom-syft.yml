@@ -24,44 +24,84 @@ steps:
   - script: |
       set -euo pipefail
 
-      BIN_DIR="$(Pipeline.Workspace)/bin"
-      mkdir -p "$BIN_DIR"
-      SYFT_BIN="$BIN_DIR/syft"
-
       echo "== Syft availability check =="
-      echo "BIN_DIR: $BIN_DIR"
 
-      # Install only if the binary isn't already present/executable
-      if [ -x "$SYFT_BIN" ]; then
-        echo "Syft already present at: $SYFT_BIN"
-        "$SYFT_BIN" version || true
-      else
-        echo "Syft not found at $SYFT_BIN. Installing (no sudo)..."
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-          | sh -s -- -b "$BIN_DIR"
+      WORK_BIN_DIR="$(Pipeline.Workspace)/bin"
+      mkdir -p "$WORK_BIN_DIR"
+      WORK_SYFT="$WORK_BIN_DIR/syft"
+      SYS_SYFT="/usr/local/bin/syft"
 
-        echo "Syft installed at: $SYFT_BIN"
-        ls -lah "$BIN_DIR"
-        "$SYFT_BIN" version
+      # Helper: check syft exists
+      have_syft() {
+        command -v syft >/dev/null 2>&1 || [ -x "$SYS_SYFT" ] || [ -x "$WORK_SYFT" ]
+      }
+
+      # If already installed anywhere, just print version and finish successfully
+      if have_syft; then
+        echo "Syft already available."
+        if command -v syft >/dev/null 2>&1; then
+          echo "syft in PATH: $(command -v syft)"
+          syft version || true
+        elif [ -x "$SYS_SYFT" ]; then
+          echo "syft at: $SYS_SYFT"
+          "$SYS_SYFT" version || true
+        else
+          echo "syft at: $WORK_SYFT"
+          "$WORK_SYFT" version || true
+        fi
+        exit 0
       fi
 
-      # Prepend path for future steps (nice-to-have, but we won't depend on it)
-      echo "##vso[task.prependpath]$BIN_DIR"
+      echo "Syft not found. Installing..."
 
-      echo "== Effective syft binary (absolute path) =="
-      echo "$SYFT_BIN"
-    displayName: "Install/Verify Syft (no sudo)"
+      # Prefer system-wide install if passwordless sudo is available
+      if sudo -n true 2>/dev/null; then
+        echo "Passwordless sudo detected. Installing syft to $SYS_SYFT ..."
+        # Install to /usr/local/bin (requires sudo)
+        # We install into a temp dir then move into place to avoid partial installs.
+        TMP_DIR="$(mktemp -d)"
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b "$TMP_DIR"
+        sudo mv "$TMP_DIR/syft" "$SYS_SYFT"
+        sudo chmod +x "$SYS_SYFT"
+        rm -rf "$TMP_DIR"
+
+        echo "Syft installed at: $SYS_SYFT"
+        "$SYS_SYFT" version
+      else
+        echo "No passwordless sudo. Installing syft to workspace: $WORK_SYFT (no sudo)..."
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b "$WORK_BIN_DIR"
+
+        echo "Syft installed at: $WORK_SYFT"
+        "$WORK_SYFT" version
+      fi
+
+      # Prepend workspace bin for later steps (nice-to-have)
+      echo "##vso[task.prependpath]$WORK_BIN_DIR"
+
+      echo "== Syft install complete =="
+      echo "System syft: $SYS_SYFT (exists? $( [ -x "$SYS_SYFT" ] && echo yes || echo no ))"
+      echo "Workspace syft: $WORK_SYFT (exists? $( [ -x "$WORK_SYFT" ] && echo yes || echo no ))"
+    displayName: "Install/Verify Syft"
 
   - script: |
       set -euo pipefail
 
-      BIN_DIR="$(Pipeline.Workspace)/bin"
-      SYFT_BIN="$BIN_DIR/syft"
+      WORK_BIN_DIR="$(Pipeline.Workspace)/bin"
+      WORK_SYFT="$WORK_BIN_DIR/syft"
+      SYS_SYFT="/usr/local/bin/syft"
 
-      if [ ! -x "$SYFT_BIN" ]; then
-        echo "ERROR: syft binary not found or not executable at $SYFT_BIN"
-        echo "BIN_DIR contents:"
-        ls -lah "$BIN_DIR" || true
+      # Choose syft binary deterministically (no PATH dependence)
+      if [ -x "$SYS_SYFT" ]; then
+        SYFT_BIN="$SYS_SYFT"
+      elif [ -x "$WORK_SYFT" ]; then
+        SYFT_BIN="$WORK_SYFT"
+      elif command -v syft >/dev/null 2>&1; then
+        SYFT_BIN="$(command -v syft)"
+      else
+        echo "ERROR: syft not found anywhere."
+        echo "Checked: $SYS_SYFT, $WORK_SYFT, PATH"
         exit 1
       fi
 
@@ -71,6 +111,7 @@ steps:
       echo "Generating SBOM for: $IMAGE"
       echo "Formats: $FORMATS"
       echo "Using syft: $SYFT_BIN"
+      "$SYFT_BIN" version || true
 
       mkdir -p sbom
 
