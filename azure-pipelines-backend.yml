@@ -1,72 +1,97 @@
 # azure-pipelines-backend.yml
 trigger:
   branches:
-    include: [main, release/*]
+    include:
+      - main
+      - release/*
   tags:
-    include: [v*]
+    include:
+      - v*
   paths:
-    include: [backend/*]
+    include:
+      - backend/*
 
 pr:
   branches:
-    include: [main]
+    include:
+      - main
   paths:
-    include: [backend/*]
+    include:
+      - backend/*
 
 variables:
-  - group: "aws-credentials"
+  - group: aws-credentials
 
   - name: AWS_REGION
-    value: "us-east-2"
+    value: us-east-2
 
   - name: EKS_CLUSTER_NAME
-    value: "capstone-project"
+    value: capstone-project
 
   # ECR registry base
   - name: ECR_REGISTRY
-    value: "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
+    value: $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
 
   # Repo name in ECR
   - name: IMAGE_NAME
-    value: "capstone-project-backend"
+    value: capstone-project-backend
 
   # Tag: commit SHA
   - name: IMAGE_TAG
-    value: "$(Build.SourceVersion)"
+    value: $(Build.SourceVersion)
 
 stages:
   - stage: PRChecks
-    displayName: "PR Fast Checks"
+    displayName: PR Fast Checks
     condition: eq(variables['Build.Reason'], 'PullRequest')
     jobs:
       - job: LintAndTest
-        displayName: "Lint & Test"
+        displayName: Lint & Test
         pool:
           name: Default
         steps:
           - template: devops/templates/python-pr-checks.yml
 
-  - stage: BuildAndPush
-    displayName: "Build, Push, Scan, SBOM, Sign"
+  - stage: BuildAndRelease
+    displayName: SBOM (source) → Build → Scan → Push → Sign
     condition: ne(variables['Build.Reason'], 'PullRequest')
     jobs:
       - job: Build
-        displayName: "Docker Build + ECR Push + Security + Sign"
+        displayName: Backend Build + Security + Push
         pool:
           name: Default
         steps:
-          # 1) Build docker image locally (BuildKit)
+          # 1) SBOM for backend SOURCE code/dependencies (NOT docker image)
+          - template: pipelines/templates/docker/sbom-syft.yml
+            parameters:
+              sourcePath: backend
+              outputFormats: "spdx-json cyclonedx-json"
+              attachToImage: false
+              artifactName: "sbom-backend-src-$(Build.BuildId)"
+
+          # 2) Build docker image locally (BuildKit)
           - template: pipelines/templates/docker/build-docker.yml
             parameters:
               imageName: "$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
-              dockerfilePath: "backend/Dockerfile"
-              buildContext: "backend"
+              dockerfilePath: backend/Dockerfile
+              buildContext: backend
               enableCache: true
               cacheRegistry: "$(ECR_REGISTRY)"
               buildArgs: ""
 
-          # 2) Push image to ECR
+          # 3) Trivy scan the LOCAL image (before push)
+          - template: pipelines/templates/docker/scan-trivy.yml
+            parameters:
+              imageName: "$(IMAGE_NAME)"
+              imageTag: "$(IMAGE_TAG)"
+              severityThreshold: "CRITICAL,HIGH"
+              failOnVulnerabilities: true
+              ignoreUnfixed: false
+              # Optional (only if you have a Trivy config file):
+              # trivyConfigPath: "policies/trivy/trivy.yaml"
+
+          # 4) Push image to ECR (only after scan passes)
           - template: pipelines/templates/docker/push-ecr.yml
             parameters:
               imageName: "$(IMAGE_NAME)"
@@ -76,47 +101,28 @@ stages:
               additionalTags: ""
               enableImageScanning: true
 
-          # 3) SBOM (Syft)
-          - template: pipelines/templates/docker/sbom-syft.yml
-            parameters:
-              imageName: "$(ECR_REGISTRY)/$(IMAGE_NAME)"
-              imageTag: "$(IMAGE_TAG)"
-              outputFormats: "spdx-json cyclonedx-json"
-              attachToImage: true
-              artifactName: "sbom-$(Build.BuildId)"
-
-          # 4) Trivy scan
-          - template: pipelines/templates/docker/scan-trivy.yml
-            parameters:
-              imageName: "$(ECR_REGISTRY)/$(IMAGE_NAME)"
-              imageTag: "$(IMAGE_TAG)"
-              severityThreshold: "CRITICAL,HIGH"
-              failOnVulnerabilities: true
-              ignoreUnfixed: false
-              regoPolicyPath: "policies/trivy"
-
-          # 5) Cosign sign
+          # 5) Keyless cosign sign (must be AFTER push to sign the registry digest)
           - template: pipelines/templates/docker/sign-cosign.yml
             parameters:
               imageName: "$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
               ecrRegistry: "$(ECR_REGISTRY)"
-              signingMethod: "keyless"
-              rekorUrl: "https://rekor.sigstore.dev"
+              signingMethod: keyless
+              rekorUrl: https://rekor.sigstore.dev
 
   - stage: DeployDev
-    displayName: "Deploy to Dev"
-    dependsOn: BuildAndPush
+    displayName: Deploy to Dev
+    dependsOn: BuildAndRelease
     condition: succeeded()
     jobs:
       - job: Deploy
-        displayName: "Deploy Backend to Dev"
+        displayName: Deploy Backend to Dev
         pool:
           name: Default
         steps:
           - template: pipelines/templates/k8s/deploy-eks.yml
             parameters:
-              environment: "dev"
-              namespace: "dev"
-              manifestsPath: "k8s/dev-backend"
+              environment: dev
+              namespace: dev
+              manifestsPath: k8s/dev-backend
               clusterName: "$(EKS_CLUSTER_NAME)"
