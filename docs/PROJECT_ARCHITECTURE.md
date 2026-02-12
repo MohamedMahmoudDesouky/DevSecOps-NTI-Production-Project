@@ -1,6 +1,7 @@
 # Project Architecture & Documentation
 
 This document provides a detailed explanation of the DevSecOps-NTI-Production-Project codebase, covering infrastructure, security, kubernetes, and CI/CD pipelines. It explains not just *what* is implemented, but *why* these specific technologies and patterns were chosen.
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/f76fbd53-4193-4a28-8955-4e3c11856250" />
 
 ## 1. Repository Structure Overview
 
