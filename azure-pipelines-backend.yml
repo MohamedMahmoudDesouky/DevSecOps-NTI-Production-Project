@@ -84,6 +84,8 @@ stages:
               imageTag: "$(IMAGE_TAG)"
               outputFormats: "spdx-json cyclonedx-json"
               attachToImage: true
+              artifactName: "sbom-$(System.StageName)-$(System.JobName)"
+
 
           # 4) Trivy scan
           - template: pipelines/templates/docker/scan-trivy.yml
