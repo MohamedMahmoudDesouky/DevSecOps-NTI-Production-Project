@@ -58,7 +58,7 @@ steps:
         # Sign the image
         cosign sign \
           --yes \
-          --oidc-issuer "https://vstoken.dev.azure.com/$(System.CollectionId)" \
+          --oidc-issuer "https://vstoken.dev.azure.com/selcon" \
           --rekor-url "${{ parameters.rekorUrl }}" \
           $IMAGE_URI
         
