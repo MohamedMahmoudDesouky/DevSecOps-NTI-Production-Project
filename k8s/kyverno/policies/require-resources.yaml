@@ -26,7 +26,6 @@ spec:
                 - dev
       exclude:
         any:
-          # Exclude system namespaces
           - resources:
               namespaces:
                 - kube-system
@@ -66,12 +65,6 @@ spec:
                 - kube-node-lease
                 - kyverno
                 - vault
-          # Exclude pods without init containers
-          - resources:
-              selector:
-                matchExpressions:
-                  - key: app
-                    operator: Exists
       preconditions:
         all:
           - key: "{{ request.object.spec.initContainers[] | length(@) }}"
