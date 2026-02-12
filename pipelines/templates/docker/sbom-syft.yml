@@ -148,3 +148,10 @@ steps:
       targetPath: "sbom"
       artifact: "${{ parameters.artifactName }}"
       publishLocation: "pipeline"
+
+  - script: |
+      set -euo pipefail
+      echo "Post-publish flush (keep job alive briefly so ADO logs finalize)"
+      sleep 3
+    displayName: "Post-publish flush"
+
