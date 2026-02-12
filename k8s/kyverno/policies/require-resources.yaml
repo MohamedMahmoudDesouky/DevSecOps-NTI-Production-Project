@@ -67,7 +67,10 @@ spec:
                 - vault
       preconditions:
         all:
-          - key: "{{ request.object.spec.initContainers[] | length(@) }}"
+          - key: "{{ request.object.spec.initContainers | type(@) }}"
+            operator: Equals
+            value: array
+          - key: "{{ request.object.spec.initContainers | length(@) }}"
             operator: GreaterThan
             value: 0
       validate:

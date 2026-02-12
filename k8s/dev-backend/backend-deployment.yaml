@@ -29,8 +29,6 @@ spec:
         runAsUser: 1000
         fsGroup: 1000
 
-      # ✅ مهم جداً عشان Kyverno (متسيبهاش nil)
-      initContainers: []
 
       containers:
         - name: backend
