@@ -1,16 +1,16 @@
+# pipelines/templates/docker/sbom-syft.yml
 parameters:
-  - name: imageName
+  # Path to source directory to scan (relative to repo root)
+  - name: sourcePath
     type: string
-
-  - name: imageTag
-    type: string
-    default: "$(Build.BuildNumber)"
+    default: "backend"
 
   # space-separated formats, e.g. "spdx-json cyclonedx-json"
   - name: outputFormats
     type: string
     default: "spdx-json cyclonedx-json"
 
+  # Kept for compatibility with callers (no-op for source SBOM)
   - name: attachToImage
     type: boolean
     default: false
@@ -18,13 +18,13 @@ parameters:
   # Unique by default to avoid "Artifact sbom already exists"
   - name: artifactName
     type: string
-    default: "sbom-$(System.StageName)-$(System.JobName)"
+    default: "sbom-src-$(System.StageName)-$(System.JobName)"
 
 steps:
   - script: |
       set -euo pipefail
 
-      echo "SBOM_SYFT_TEMPLATE_VERSION=20260212_v1"
+      echo "SBOM_SYFT_TEMPLATE_VERSION=20260212_SOURCE_v1"
       echo "== Syft availability check =="
 
       WORK_BIN_DIR="$(Pipeline.Workspace)/bin"
@@ -86,7 +86,7 @@ steps:
       ls -lah "$SYS_SYFT" 2>/dev/null || true
       ls -lah "$WORK_SYFT" 2>/dev/null || true
       command -v syft || true
-    displayName: "Install/Verify Syft (no sudo)"
+    displayName: "Install/Verify Syft"
 
   - script: |
       set -euo pipefail
@@ -108,25 +108,39 @@ steps:
         exit 1
       fi
 
-      IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      # Resolve source path relative to repo root
+      SRC_REL="${{ parameters.sourcePath }}"
+      SRC_ABS="$(Build.SourcesDirectory)/$SRC_REL"
       FORMATS="${{ parameters.outputFormats }}"
 
-      echo "Generating SBOM for: $IMAGE"
+      echo "== Source SBOM mode =="
+      echo "Source (relative): $SRC_REL"
+      echo "Source (absolute): $SRC_ABS"
       echo "Formats: $FORMATS"
       echo "Using syft: $SYFT_BIN"
       "$SYFT_BIN" version || true
 
+      if [ ! -d "$SRC_ABS" ]; then
+        echo "ERROR: sourcePath '$SRC_REL' not found at '$SRC_ABS'"
+        echo "Repo root contents:"
+        ls -lah "$(Build.SourcesDirectory)"
+        exit 1
+      fi
+
       mkdir -p sbom
+
+      TARGET="dir:$SRC_ABS"
+      echo "Generating SBOM for: $TARGET"
 
       for fmt in $FORMATS; do
         OUT="sbom/sbom.${fmt}.json"
-        echo "-> $SYFT_BIN $IMAGE -o $fmt > $OUT"
-        "$SYFT_BIN" "$IMAGE" -o "$fmt" > "$OUT"
+        echo "-> $SYFT_BIN $TARGET -o $fmt > $OUT"
+        "$SYFT_BIN" "$TARGET" -o "$fmt" > "$OUT"
       done
 
       echo "SBOM outputs:"
       ls -lah sbom
-    displayName: "Generate SBOM(s) with Syft"
+    displayName: "Generate SBOM(s) from SOURCE with Syft"
 
   - task: PublishPipelineArtifact@1
     displayName: "Publish SBOM Artifact"
