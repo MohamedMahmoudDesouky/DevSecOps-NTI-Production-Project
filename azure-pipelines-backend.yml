@@ -77,14 +77,14 @@ stages:
               additionalTags: ""
               enableImageScanning: true
 
-          # 3) SBOM (Syft)
+                  # 3) SBOM (Syft)
           - template: pipelines/templates/docker/sbom-syft.yml
             parameters:
               imageName: "$(ECR_REGISTRY)/$(IMAGE_NAME)"
               imageTag: "$(IMAGE_TAG)"
               outputFormats: "spdx-json cyclonedx-json"
               attachToImage: true
-              artifactName: "sbom-$(System.StageName)-$(System.JobName)"
+              artifactName: "sbom-$(Build.BuildId)"
 
 
           # 4) Trivy scan
