@@ -61,8 +61,15 @@ stages:
         pool:
           name: Default
         steps:
+          - script: |
+              echo "Build.Reason=$(Build.Reason)"
+              echo "Build.SourceBranch=$(Build.SourceBranch)"
+              echo "Build.SourceBranchName=$(Build.SourceBranchName)"
+            displayName: "Debug branch variables"
+
           - checkout: self
             persistCredentials: true
+
 
           # 1) SBOM for backend SOURCE code/dependencies (NOT docker image)
           - template: pipelines/templates/docker/sbom-syft.yml
@@ -119,10 +126,9 @@ stages:
   - stage: DeployDev
     displayName: Deploy to Dev
     dependsOn: BuildAndRelease
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'))
     jobs:
       - job: Deploy
-        displayName: Deploy Backend to Dev
         pool:
           name: Default
         steps:
@@ -132,3 +138,4 @@ stages:
               namespace: dev
               manifestsPath: k8s/dev-backend
               clusterName: "$(EKS_CLUSTER_NAME)"
+
