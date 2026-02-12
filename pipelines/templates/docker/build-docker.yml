@@ -66,3 +66,72 @@ steps:
         exit 1
       fi
     displayName: "Prereqs (no sudo): verify docker + aws + curl + jq"
+
+  - script: |
+      set -euo pipefail
+
+      IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
+      DOCKERFILE="${{ parameters.dockerfilePath }}"
+      CONTEXT="${{ parameters.buildContext }}"
+      BUILD_ARGS_RAW="${{ parameters.buildArgs }}"
+      ENABLE_CACHE="${{ parameters.enableCache }}"
+      CACHE_REGISTRY="${{ parameters.cacheRegistry }}"
+
+      echo "== Build inputs =="
+      echo "Image:       $IMAGE"
+      echo "Dockerfile:  $DOCKERFILE"
+      echo "Context:     $CONTEXT"
+      echo "EnableCache: $ENABLE_CACHE"
+      echo "CacheReg:    $CACHE_REGISTRY"
+      echo "BuildArgs:   $BUILD_ARGS_RAW"
+
+      echo ""
+      echo "== Ensure buildx builder =="
+      docker buildx version || true
+
+      # Create/use a named builder (safe if it already exists)
+      docker buildx create --name azdo-builder --use >/dev/null 2>&1 || docker buildx use azdo-builder
+      docker buildx inspect --bootstrap
+
+      echo ""
+      echo "== Compose build-args =="
+      BUILD_ARGS=()
+      if [ -n "$BUILD_ARGS_RAW" ]; then
+        # buildArgs can be passed as:
+        #   "KEY1=VAL1 KEY2=VAL2"
+        # or:
+        #   "KEY1=VAL1\nKEY2=VAL2"
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          BUILD_ARGS+=(--build-arg "$line")
+        done < <(printf "%s" "$BUILD_ARGS_RAW" | tr ' ' '\n' | sed '/^$/d')
+      fi
+
+      echo ""
+      echo "== Build (BuildKit) and LOAD into local Docker =="
+      # IMPORTANT: --load ensures the image exists locally for subsequent 'docker tag/push' steps.
+      # Cache is optional and uses a registry-based cache image tag "buildcache".
+      CACHE_ARGS=()
+      if [ "$ENABLE_CACHE" = "true" ] && [ -n "$CACHE_REGISTRY" ]; then
+        CACHE_REF="$CACHE_REGISTRY/${{ parameters.imageName }}:buildcache"
+        echo "Using registry cache ref: $CACHE_REF"
+        CACHE_ARGS+=(--cache-from "type=registry,ref=$CACHE_REF")
+        CACHE_ARGS+=(--cache-to "type=registry,ref=$CACHE_REF,mode=max")
+      else
+        echo "Cache disabled or cacheRegistry not provided."
+      fi
+
+      docker buildx build \
+        -f "$DOCKERFILE" \
+        -t "$IMAGE" \
+        "${CACHE_ARGS[@]}" \
+        "${BUILD_ARGS[@]}" \
+        --load \
+        "$CONTEXT"
+
+      echo ""
+      echo "== Verify image exists locally =="
+      docker image inspect "$IMAGE" >/dev/null
+      echo "Local image is present: $IMAGE"
+      docker images --format '{{.Repository}}:{{.Tag}}' | grep -F "$IMAGE" || true
+    displayName: "Build Docker image (BuildKit + --load)"
