@@ -28,6 +28,7 @@ The system is designed with:
 # 🌍 Architecture Diagram
 
 ![Production Architecture](architecture.png)
+<img width="2048" height="1152" alt="Screenshot From 2026-02-12 16-21-42" src="https://github.com/user-attachments/assets/a8ce8543-7b17-4e0f-900d-95c456347d69" />
 
 ---
 
