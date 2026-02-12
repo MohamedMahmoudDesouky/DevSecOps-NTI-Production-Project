@@ -72,9 +72,10 @@ steps:
       ls -lah sbom
     displayName: "Generate SBOM(s) with Syft"
 
-  - task: PublishPipelineArtifact@1
-    displayName: "Publish SBOM Artifact"
-    inputs:
-      targetPath: "sbom"
-      artifact: "${{ parameters.artifactName }}"
-      publishLocation: "pipeline"
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish SBOM Artifact"
+        inputs:
+          targetPath: "sbom"
+          artifact: "sbom-$(System.StageName)-$(System.JobName)"
+          publishLocation: "pipeline"
+
