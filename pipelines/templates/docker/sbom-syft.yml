@@ -6,6 +6,7 @@ parameters:
     type: string
     default: "$(Build.BuildNumber)"
 
+  # space-separated formats, e.g. "spdx-json cyclonedx-json"
   - name: outputFormats
     type: string
     default: "spdx-json cyclonedx-json"
@@ -14,10 +15,10 @@ parameters:
     type: boolean
     default: false
 
-  - name: artifactName   # 👈 THIS MUST EXIST
+  # Unique by default to avoid "Artifact sbom already exists"
+  - name: artifactName
     type: string
     default: "sbom-$(System.StageName)-$(System.JobName)"
-
 
 steps:
   - script: |
@@ -25,6 +26,9 @@ steps:
 
       BIN_DIR="$(Pipeline.Workspace)/bin"
       mkdir -p "$BIN_DIR"
+
+      # Ensure PATH is updated for THIS step as well
+      export PATH="$BIN_DIR:$PATH"
       echo "##vso[task.prependpath]$BIN_DIR"
 
       echo "== Syft availability check =="
@@ -33,20 +37,23 @@ steps:
         echo "Syft already installed: $(command -v syft)"
         syft version || true
       else
-        echo "Syft not found. Installing to $BIN_DIR (no sudo)..."
+        echo "Syft not found. Installing to $BIN_DIR ..."
         curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
           | sh -s -- -b "$BIN_DIR"
 
-        echo "Syft installed:"
+        echo "Syft installed at: $BIN_DIR/syft"
         "$BIN_DIR/syft" version
       fi
 
       echo "== Effective syft path =="
-      command -v syft
-    displayName: "Install/Verify Syft (no sudo)"
+      command -v syft || { echo "ERROR: syft not found in PATH"; ls -lah "$BIN_DIR"; exit 1; }
+    displayName: "Install/Verify Syft"
 
   - script: |
       set -euo pipefail
+
+      BIN_DIR="$(Pipeline.Workspace)/bin"
+      export PATH="$BIN_DIR:$PATH"
 
       IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
       FORMATS="${{ parameters.outputFormats }}"
@@ -56,7 +63,18 @@ steps:
 
       mkdir -p sbom
 
-      SYFT_BIN="$(command -v syft)"
+      # Robust syft resolution: prefer PATH, fallback to BIN_DIR
+      if command -v syft >/dev/null 2>&1; then
+        SYFT_BIN="$(command -v syft)"
+      elif [ -x "$BIN_DIR/syft" ]; then
+        SYFT_BIN="$BIN_DIR/syft"
+      else
+        echo "ERROR: syft not found"
+        echo "BIN_DIR contents:"
+        ls -lah "$BIN_DIR" || true
+        exit 1
+      fi
+
       echo "Using syft: $SYFT_BIN"
       "$SYFT_BIN" version || true
 
@@ -66,6 +84,7 @@ steps:
         "$SYFT_BIN" "$IMAGE" -o "$fmt" > "$OUT"
       done
 
+      echo "SBOM outputs:"
       ls -lah sbom
     displayName: "Generate SBOM(s) with Syft"
 
