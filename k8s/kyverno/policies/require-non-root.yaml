@@ -26,7 +26,6 @@ spec:
                 - dev
       exclude:
         any:
-          # Exclude system namespaces that may require root
           - resources:
               namespaces:
                 - kube-system
@@ -114,7 +113,6 @@ spec:
                 - kube-public
                 - kube-node-lease
                 - kyverno
-          # Exclude backend pods that may need writable filesystem for Vault agent
           - resources:
               selector:
                 matchLabels:
