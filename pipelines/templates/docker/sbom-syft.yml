@@ -6,7 +6,6 @@ parameters:
     type: string
     default: "$(Build.BuildNumber)"
 
-  # space-separated formats, e.g. "spdx-json cyclonedx-json"
   - name: outputFormats
     type: string
     default: "spdx-json cyclonedx-json"
@@ -15,10 +14,10 @@ parameters:
     type: boolean
     default: false
 
-  # Unique by default to avoid "Artifact sbom already exists"
-  - name: artifactName
+  - name: artifactName   # 👈 THIS MUST EXIST
     type: string
     default: "sbom-$(System.StageName)-$(System.JobName)"
+
 
 steps:
   - script: |
