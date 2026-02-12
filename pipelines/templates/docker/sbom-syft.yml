@@ -15,7 +15,7 @@ parameters:
     type: boolean
     default: false
 
-  # NEW: artifact name (default is unique per stage+job to prevent "already exists")
+  # Unique by default to avoid "Artifact sbom already exists"
   - name: artifactName
     type: string
     default: "sbom-$(System.StageName)-$(System.JobName)"
@@ -35,7 +35,6 @@ steps:
         syft version || true
       else
         echo "Syft not found. Installing to $BIN_DIR (no sudo)..."
-        # Install script drops 'syft' into BIN_DIR
         curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
           | sh -s -- -b "$BIN_DIR"
 
@@ -58,7 +57,6 @@ steps:
 
       mkdir -p sbom
 
-      # Use syft from PATH (system syft or the one we installed into Pipeline.Workspace/bin)
       SYFT_BIN="$(command -v syft)"
       echo "Using syft: $SYFT_BIN"
       "$SYFT_BIN" version || true
@@ -72,10 +70,9 @@ steps:
       ls -lah sbom
     displayName: "Generate SBOM(s) with Syft"
 
-      - task: PublishPipelineArtifact@1
-        displayName: "Publish SBOM Artifact"
-        inputs:
-          targetPath: "sbom"
-          artifact: "sbom-$(System.StageName)-$(System.JobName)"
-          publishLocation: "pipeline"
-
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish SBOM Artifact"
+    inputs:
+      targetPath: "sbom"
+      artifact: "${{ parameters.artifactName }}"
+      publishLocation: "pipeline"
