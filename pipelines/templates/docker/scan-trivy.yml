@@ -5,7 +5,6 @@ parameters:
     type: string
     default: "$(Build.BuildNumber)"
 
-  # Trivy still uses severity to decide what to include in the report
   - name: severityThreshold
     type: string
     default: "CRITICAL,HIGH,MEDIUM,LOW"
@@ -22,7 +21,7 @@ parameters:
     type: string
     default: "latest"
 
-  # NEW: path to rego policy (in repo)
+  # Folder which contains rego policies + lib/
   - name: regoPolicyPath
     type: string
     default: "policies/trivy"
@@ -31,23 +30,34 @@ steps:
   - script: |
       set -euo pipefail
 
-      echo "##[section]Install jq"
-      if ! command -v jq >/dev/null 2>&1; then
-        sudo apt-get update
-        sudo apt-get install -y jq
-      fi
+      echo "== OS info =="
+      cat /etc/os-release || true
+
+      echo "##[section]Install prerequisites (jq/wget/tar)"
+      sudo dnf -y install jq wget tar
+
       jq --version
-    displayName: "Install jq"
+      wget --version | head -n 1
+      tar --version | head -n 1
+    displayName: "Prereqs (CentOS 10): jq + wget + tar"
 
   - script: |
       set -euo pipefail
 
-      echo "##[section]Installing Trivy"
+      echo "##[section]Installing Trivy (RPM repo)"
+
       if ! command -v trivy &> /dev/null; then
-        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
-        sudo apt-get update
-        sudo apt-get install -y trivy
+        # Add Aqua Trivy repo for RHEL/CentOS
+        sudo tee /etc/yum.repos.d/trivy.repo >/dev/null <<'EOF'
+      [trivy]
+      name=Trivy repository
+      baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/$basearch/
+      enabled=1
+      gpgcheck=1
+      gpgkey=https://aquasecurity.github.io/trivy-repo/rpm/public.key
+EOF
+        sudo dnf -y makecache
+        sudo dnf -y install trivy
       fi
 
       trivy --version
@@ -61,8 +71,8 @@ steps:
         CONFTEST_VERSION="0.56.0"
         wget -q "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
         tar -xzf "conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
-        sudo mv conftest /usr/local/bin/conftest
-        rm -f "conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+        sudo install -m 0755 conftest /usr/local/bin/conftest
+        rm -f conftest "conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
       fi
       conftest --version
     displayName: "Install Conftest"
@@ -71,14 +81,13 @@ steps:
       set -euo pipefail
 
       echo "##[section]Scanning image (Trivy JSON): ${{ parameters.imageName }}:${{ parameters.imageTag }}"
-      mkdir -p $(Build.ArtifactStagingDirectory)/trivy-reports
+      mkdir -p "$(Build.ArtifactStagingDirectory)/trivy-reports"
 
       IGNORE_UNFIXED=""
       if [ "${{ parameters.ignoreUnfixed }}" = "True" ]; then
         IGNORE_UNFIXED="--ignore-unfixed"
       fi
 
-      # JSON for policy evaluation
       trivy image \
         --severity "${{ parameters.severityThreshold }}" \
         --format json \
@@ -93,7 +102,7 @@ steps:
         "${{ parameters.imageName }}:${{ parameters.imageTag }}" || true
 
       echo "Report written to: $(Build.ArtifactStagingDirectory)/trivy-reports/trivy-report.json"
-      ls -la $(Build.ArtifactStagingDirectory)/trivy-reports/
+      ls -la "$(Build.ArtifactStagingDirectory)/trivy-reports/"
     displayName: "Run Trivy Scan (JSON + Table)"
 
   - script: |
@@ -105,8 +114,7 @@ steps:
       OUTDIR="$(Build.ArtifactStagingDirectory)/trivy-policy-input"
       mkdir -p "$OUTDIR"
 
-      # Flatten vulnerabilities into one JSON per vulnerability for conftest
-      # Each file contains fields like Severity + PublishedDate which your policy uses
+      # One JSON per vulnerability (so policy can read input.Severity, input.PublishedDate, etc.)
       jq -c '
         [.Results[]?.Vulnerabilities[]?]
         | to_entries[]
@@ -116,7 +124,6 @@ steps:
       COUNT=$(ls -1 "$OUTDIR"/*.json 2>/dev/null | wc -l | tr -d " ")
       echo "Prepared $COUNT vulnerability input files in $OUTDIR"
 
-      # If no vulns found at all, policy pass immediately
       if [ "$COUNT" -eq 0 ]; then
         echo "No vulnerabilities in report. Policy pass."
         exit 0
@@ -130,26 +137,23 @@ steps:
       set -euo pipefail
 
       echo "##[section]Run Policy (Conftest) with age-based ignore rules"
-      POLICY="${{ parameters.regoPolicyPath }}"
+
+      POLICY_DIR="${{ parameters.regoPolicyPath }}"
       INPUT_DIR="$(Build.ArtifactStagingDirectory)/trivy-policy-input"
 
-      if [ ! -f "$POLICY" ]; then
-        echo "##vso[task.logissue type=error]Rego policy not found at: $POLICY"
+      # Since you now have lib/ + policy files, we expect a directory
+      if [ ! -d "$POLICY_DIR" ]; then
+        echo "##vso[task.logissue type=error]Rego policy directory not found at: $POLICY_DIR"
+        ls -la policies || true
+        ls -la "$POLICY_DIR" || true
         exit 1
       fi
 
-      # IMPORTANT:
-      # Your rego defines default ignore=false and sets ignore=true for vulns to ignore.
-      # So we FAIL if ignore is NOT true.
-      # conftest can check a 'deny' rule easiest, but you wrote 'ignore'.
-      # We'll wrap it by evaluating and failing on non-ignored items using `--output json` and jq.
-
       set +e
-      conftest test "$INPUT_DIR" -p policies/trivy --output json > "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json"
+      conftest test "$INPUT_DIR" -p "$POLICY_DIR" --output json > "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json"
       RC=$?
       set -e
 
-      # conftest returns 0 if all pass; 1 if any fail.
       cat "$(Build.ArtifactStagingDirectory)/trivy-reports/conftest-result.json" | jq '.'
 
       if [ "${{ parameters.failOnVulnerabilities }}" = "True" ] && [ $RC -ne 0 ]; then
@@ -177,4 +181,3 @@ steps:
       artifact: "trivy-policy-input"
       publishLocation: "pipeline"
     condition: always()
-
