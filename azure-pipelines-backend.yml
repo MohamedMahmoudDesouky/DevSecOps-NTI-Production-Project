@@ -18,6 +18,7 @@ pr:
   paths:
     include:
       - backend/*
+      - k8s/dev-backend/*
 
 variables:
   - group: aws-credentials
