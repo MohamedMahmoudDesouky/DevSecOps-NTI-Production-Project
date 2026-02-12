@@ -79,10 +79,10 @@ stages:
                 --key "$(tfStateKey)" \
                 --region "$(awsRegion)" || true
 
-              aws dynamodb scan \
-                --table-name "$(tfLockTable)" \
-                --region "$(awsRegion)" \
-                --max-items 50 || true
+              # aws dynamodb scan \
+              #   --table-name "$(tfLockTable)" \
+              #   --region "$(awsRegion)" \
+              #   --max-items 50 || true
 
               echo "== Clean local terraform cache =="
               rm -rf .terraform .terraform.lock.hcl
