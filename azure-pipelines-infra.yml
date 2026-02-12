@@ -196,22 +196,39 @@ stages:
 
           - script: |
               set -euxo pipefail
+
+              echo "== Check if Kyverno is already installed =="
+
+              if helm status kyverno -n kyverno >/dev/null 2>&1; then
+                echo "Kyverno already installed. Checking health..."
+
+                kubectl -n kyverno get deploy,po
+
+                # Check if admission controller is ready
+                if kubectl -n kyverno rollout status deploy/kyverno-admission-controller --timeout=30s; then
+                  echo "Kyverno is healthy. Skipping install."
+                  exit 0
+                else
+                  echo "Kyverno exists but not healthy. Reinstalling..."
+                fi
+              fi
+
+              echo "== Installing Kyverno =="
+
               helm repo add kyverno https://kyverno.github.io/kyverno/ || true
               helm repo update
 
-              # Pin chart + Kyverno version compatible with Kubernetes 1.29
               helm upgrade --install kyverno kyverno/kyverno \
                 --version 3.3.4 \
                 -n kyverno --create-namespace \
                 --set image.tag="v1.12.7" \
-                --set admissionController.replicas=1 \
-                --set backgroundController.replicas=1 \
-                --set cleanupController.replicas=1 \
-                --set reportsController.replicas=1 \
-                --wait --timeout 15m
+                -f k8s/kyverno/kyverno-values.yaml \
+                --wait --timeout 8m
 
-              kubectl -n kyverno get pods
-            displayName: "Install/Upgrade Kyverno (K8s 1.29 compatible)"
+
+              echo "Kyverno installation complete."
+            displayName: "Install Kyverno (Only if Missing)"
+
 
 
           - script: |
