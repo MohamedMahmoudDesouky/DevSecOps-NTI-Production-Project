@@ -111,7 +111,8 @@ stages:
               imageTag: "$(IMAGE_TAG)"
               ecrRegistry: "$(ECR_REGISTRY)"
               signingMethod: keypair
-              cosignKey: "$(COSIGN_PRIVATE_KEY)"
+              cosignKey: "$(COSIGN_PRIVATE_KEY_B64)"
+
 
 
   - stage: DeployDev
