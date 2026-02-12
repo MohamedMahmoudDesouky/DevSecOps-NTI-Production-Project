@@ -18,11 +18,52 @@ parameters:
     default: true
 
 steps:
-  - task: Docker@2
-    displayName: "Login to ECR"
-    inputs:
-      command: login
-      containerRegistry: "AWS-ECR-ServiceConnection"
+  # 0) (Optional) Ensure prerequisites on CentOS (aws + docker)
+  - script: |
+      set -euo pipefail
+
+      echo "== OS info =="
+      cat /etc/os-release || true
+
+      echo "== Check docker =="
+      if ! command -v docker >/dev/null 2>&1; then
+        echo "Docker not found. Installing..."
+        sudo dnf -y install dnf-plugins-core
+        sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      fi
+      sudo systemctl enable --now docker
+      docker version
+      docker info
+
+      echo "== Check aws cli =="
+      if ! command -v aws >/dev/null 2>&1; then
+        echo "AWS CLI not found. Installing..."
+        sudo dnf -y install awscli
+      fi
+      aws --version
+    displayName: "Prereqs (CentOS 10): docker + aws"
+
+  # 1) Login to ECR using AWS CLI
+  - script: |
+      set -euo pipefail
+
+      : "${AWS_REGION:?AWS_REGION is required}"
+      : "${AWS_ACCOUNT_ID:?AWS_ACCOUNT_ID is required}"
+
+      REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      echo "Logging in to ECR: $REGISTRY"
+
+      aws ecr get-login-password --region "${AWS_REGION}" \
+        | docker login --username AWS --password-stdin "${REGISTRY}"
+
+      echo "ECR login OK"
+    displayName: "Login to ECR (aws ecr get-login-password)"
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+      AWS_REGION: $(AWS_REGION)
+      AWS_ACCOUNT_ID: $(AWS_ACCOUNT_ID)
 
   - script: |
       set -euo pipefail
@@ -35,18 +76,16 @@ steps:
       echo "Local image: $LOCAL_IMAGE"
       echo "ECR repository: $ECR_REPO"
 
-      # Ensure ECR repository exists
       aws ecr describe-repositories \
-        --repository-names ${{ parameters.imageName }} \
-        --region $(AWS_REGION) || \
+        --repository-names "${{ parameters.imageName }}" \
+        --region "$(AWS_REGION)" >/dev/null 2>&1 || \
       aws ecr create-repository \
-        --repository-name ${{ parameters.imageName }} \
-        --region $(AWS_REGION) \
+        --repository-name "${{ parameters.imageName }}" \
+        --region "$(AWS_REGION)" \
         --image-scanning-configuration scanOnPush=${{ parameters.enableImageScanning }} \
-        --image-tag-mutability IMMUTABLE
+        --image-tag-mutability IMMUTABLE >/dev/null
 
       echo "ECR repository ready"
-
     displayName: "Ensure ECR Repository Exists"
     env:
       AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
@@ -60,32 +99,28 @@ steps:
       LOCAL_IMAGE="${{ parameters.imageName }}:${{ parameters.imageTag }}"
 
       echo "##[section]Tagging image for ECR"
+      echo "Local image: $LOCAL_IMAGE"
 
-      # Tag with build number
       PRIMARY_TAG="$ECR_REPO:${{ parameters.imageTag }}"
-      docker tag $LOCAL_IMAGE $PRIMARY_TAG
+      docker tag "$LOCAL_IMAGE" "$PRIMARY_TAG"
       echo "Tagged: $PRIMARY_TAG"
 
-      # Tag with commit SHA
-      COMMIT_SHA=$(echo $(Build.SourceVersion) | cut -c1-7)
+      COMMIT_SHA="$(echo $(Build.SourceVersion) | cut -c1-7)"
       COMMIT_TAG="$ECR_REPO:sha-$COMMIT_SHA"
-      docker tag $LOCAL_IMAGE $COMMIT_TAG
+      docker tag "$LOCAL_IMAGE" "$COMMIT_TAG"
       echo "Tagged: $COMMIT_TAG"
 
-      # Tag with latest (if enabled)
       if [ "${{ parameters.pushLatest }}" = "True" ]; then
         LATEST_TAG="$ECR_REPO:latest"
-        docker tag $LOCAL_IMAGE $LATEST_TAG
+        docker tag "$LOCAL_IMAGE" "$LATEST_TAG"
         echo "Tagged: $LATEST_TAG"
       fi
 
-      # Additional custom tags
       ${{ each tag in parameters.additionalTags }}:
         CUSTOM_TAG="$ECR_REPO:${{ tag }}"
-        docker tag $LOCAL_IMAGE $CUSTOM_TAG
+        docker tag "$LOCAL_IMAGE" "$CUSTOM_TAG"
         echo "Tagged: $CUSTOM_TAG"
       done
-
     displayName: "Tag Image for ECR"
 
   - script: |
@@ -95,29 +130,24 @@ steps:
 
       echo "##[section]Pushing images to ECR"
 
-      # Push primary tag
       echo "##[command]Pushing $ECR_REPO:${{ parameters.imageTag }}"
-      docker push $ECR_REPO:${{ parameters.imageTag }}
+      docker push "$ECR_REPO:${{ parameters.imageTag }}"
 
-      # Push commit SHA tag
-      COMMIT_SHA=$(echo $(Build.SourceVersion) | cut -c1-7)
+      COMMIT_SHA="$(echo $(Build.SourceVersion) | cut -c1-7)"
       echo "##[command]Pushing $ECR_REPO:sha-$COMMIT_SHA"
-      docker push $ECR_REPO:sha-$COMMIT_SHA
+      docker push "$ECR_REPO:sha-$COMMIT_SHA"
 
-      # Push latest (if enabled)
       if [ "${{ parameters.pushLatest }}" = "True" ]; then
         echo "##[command]Pushing $ECR_REPO:latest"
-        docker push $ECR_REPO:latest
+        docker push "$ECR_REPO:latest"
       fi
 
-      # Push additional tags
       ${{ each tag in parameters.additionalTags }}:
         echo "##[command]Pushing $ECR_REPO:${{ tag }}"
-        docker push $ECR_REPO:${{ tag }}
+        docker push "$ECR_REPO:${{ tag }}"
       done
 
       echo "##[section]All images pushed successfully"
-
     displayName: "Push Images to ECR"
 
   - script: |
@@ -125,8 +155,16 @@ steps:
 
       ECR_REPO="${{ parameters.ecrRegistry }}/${{ parameters.imageName }}"
 
-      # Get image digest
-      IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_REPO:${{ parameters.imageTag }} | cut -d'@' -f2)
+      # After push, RepoDigests should exist locally for the ECR-tagged image
+      REF="$(docker inspect --format='{{index .RepoDigests 0}}' "$ECR_REPO:${{ parameters.imageTag }}" || true)"
+
+      if [ -z "$REF" ]; then
+        echo "##vso[task.logissue type=warning]RepoDigest not found locally. Trying docker pull then inspect..."
+        docker pull "$ECR_REPO:${{ parameters.imageTag }}"
+        REF="$(docker inspect --format='{{index .RepoDigests 0}}' "$ECR_REPO:${{ parameters.imageTag }}")"
+      fi
+
+      IMAGE_DIGEST="$(echo "$REF" | cut -d'@' -f2)"
 
       echo "##[section]Image Push Summary"
       echo "Repository: $ECR_REPO"
@@ -134,14 +172,12 @@ steps:
       echo "Digest: $IMAGE_DIGEST"
       echo "Full URI: $ECR_REPO@$IMAGE_DIGEST"
 
-      # Set output variables
       echo "##vso[task.setvariable variable=ImageDigest;isOutput=true]$IMAGE_DIGEST"
       echo "##vso[task.setvariable variable=ImageUri;isOutput=true]$ECR_REPO:${{ parameters.imageTag }}"
       echo "##vso[task.setvariable variable=ImageUriWithDigest;isOutput=true]$ECR_REPO@$IMAGE_DIGEST"
 
-      # Create manifest file
-      mkdir -p $(Build.ArtifactStagingDirectory)/manifests
-      cat > $(Build.ArtifactStagingDirectory)/manifests/image-manifest.json <<EOF
+      mkdir -p "$(Build.ArtifactStagingDirectory)/manifests"
+      cat > "$(Build.ArtifactStagingDirectory)/manifests/image-manifest.json" <<EOF
       {
         "repository": "$ECR_REPO",
         "tag": "${{ parameters.imageTag }}",
@@ -155,7 +191,7 @@ steps:
       EOF
 
       echo "Manifest created at: $(Build.ArtifactStagingDirectory)/manifests/image-manifest.json"
-
+      cat "$(Build.ArtifactStagingDirectory)/manifests/image-manifest.json"
     displayName: "Generate Image Manifest"
     name: ImageManifest
 
