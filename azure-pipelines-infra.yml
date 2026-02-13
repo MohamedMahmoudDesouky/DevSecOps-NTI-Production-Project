@@ -21,7 +21,7 @@ variables:
 
   # Backend settings (kept as variables so they’re easy to change)
   - name: tfStateBucket
-    value: "capstone-tf-state-1770806700"
+    value: "capstone-tf-state-1770945563"
   - name: tfStateKey
     value: "final-project/terraform.tfstate"
   - name: tfLockTable
@@ -64,6 +64,13 @@ stages:
           - script: |
               set -euxo pipefail
 
+              # Install AWS CLI if missing
+              if ! command -v aws &> /dev/null; then
+                  echo "AWS CLI not found. Installing..."
+                  sudo apt-get update
+                  sudo apt-get install -y awscli
+              fi
+
               echo "== Repo diagnostics =="
               git log -1 --oneline || true
               df -h || true
@@ -88,17 +95,24 @@ stages:
               rm -rf .terraform .terraform.lock.hcl
 
               echo "== Terraform init (with retry) =="
+              INIT_SUCCESS="false"
               for i in 1 2 3; do
                 echo "Attempt $i/3"
                 if terraform init -input=false -reconfigure -no-color \
                   -backend-config="bucket=$(tfStateBucket)" \
                   -backend-config="key=$(tfStateKey)" \
                   -backend-config="region=$(awsRegion)"; then
+                  INIT_SUCCESS="true"
                   break
                 fi
                 echo "terraform init failed. Sleeping 20s then retry..."
                 sleep 20
               done
+
+              if [ "$INIT_SUCCESS" != "true" ]; then
+                echo "##vso[task.logissue type=error]Terraform Init failed after 3 attempts."
+                exit 1
+              fi
             displayName: "Terraform Init & Exhaustive Diagnostics"
             workingDirectory: "terraform"
             env:
@@ -186,6 +200,11 @@ stages:
 
           - script: |
               set -euxo pipefail
+
+              if ! command -v aws &> /dev/null; then
+                  sudo apt-get update && sudo apt-get install -y awscli
+              fi
+
               aws eks update-kubeconfig --name "$(clusterName)" --region "$(awsRegion)"
             displayName: "Update Kubeconfig"
             env:
@@ -247,6 +266,11 @@ stages:
         steps:
           - script: |
               set -euxo pipefail
+
+              if ! command -v aws &> /dev/null; then
+                  sudo apt-get update && sudo apt-get install -y awscli
+              fi
+
               aws eks update-kubeconfig --name "$(clusterName)" --region "$(awsRegion)"
             displayName: "Update Kubeconfig"
             env:
@@ -285,6 +309,11 @@ stages:
           # 1) Fetch Terraform Outputs (Need Vault IP & DynamoDB Table)
           - script: |
               set -euo pipefail
+
+              if ! command -v aws &> /dev/null; then
+                  sudo apt-get update && sudo apt-get install -y awscli
+              fi
+
               cd terraform
               echo "Initializing Terraform..."
               terraform init -input=false -reconfigure -no-color \
@@ -486,6 +515,10 @@ stages:
           # 3) Get Vault Public IP (from AWS) + Service Account Token
           - script: |
               set -euo pipefail
+
+              if ! command -v aws &> /dev/null; then
+                  sudo apt-get update && sudo apt-get install -y awscli
+              fi
 
               # Configure AWS
               aws configure set aws_access_key_id $(AWS_ACCESS_KEY_ID)
