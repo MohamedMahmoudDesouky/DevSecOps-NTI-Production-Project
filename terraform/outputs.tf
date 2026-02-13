@@ -36,9 +36,9 @@ output "frontend_ecr_url" {
 #   value = module.vault.vault_kms_key_arn
 # }
 
-# output "vault_dynamodb_table_name" {
-#   value = module.vault.vault_dynamodb_table_name
-# }
+output "vault_dynamodb_table_name" {
+  value = module.vault.vault_dynamodb_table_name
+}
 
 # output "vault_security_group_id" {
 #   value = module.vault.vault_security_group_id

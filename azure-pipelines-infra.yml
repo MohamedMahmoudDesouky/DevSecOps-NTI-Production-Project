@@ -158,7 +158,6 @@ stages:
         pool:
           name: Default
         steps:
-
           - script: |
               set -euxo pipefail
 
@@ -229,8 +228,6 @@ stages:
               echo "Kyverno installation complete."
             displayName: "Install Kyverno (Only if Missing)"
 
-
-
           - script: |
               set -euxo pipefail
               kubectl apply -f k8s/kyverno/policies/
@@ -278,3 +275,306 @@ stages:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
               AWS_DEFAULT_REGION: $(awsRegion)
+
+      - job: Vault_Init
+        displayName: "Initialize/Reset Vault & Export Token"
+        dependsOn: Vault_Injector
+        pool:
+          name: Default
+        steps:
+          # 1) Fetch Terraform Outputs (Need Vault IP & DynamoDB Table)
+          - script: |
+              set -euo pipefail
+              cd terraform
+              echo "Initializing Terraform..."
+              terraform init -input=false -reconfigure -no-color \
+                  -backend-config="bucket=$(tfStateBucket)" \
+                  -backend-config="key=$(tfStateKey)" \
+                  -backend-config="region=$(awsRegion)" >/dev/null
+
+              echo "Fetching outputs..."
+              VAULT_IP=$(aws ec2 describe-instances \
+                --filters "Name=tag:Name,Values=vault-instance" \
+                --query "Reservations[].Instances[].PublicIpAddress" \
+                --output text)
+
+              TABLE_NAME=$(terraform output -raw vault_dynamodb_table_name)
+
+              if [ -z "$VAULT_IP" ] || [ "$VAULT_IP" == "None" ]; then
+                  echo "##vso[task.logissue type=error]Vault IP not found"
+                  exit 1
+              fi
+
+              echo "Vault IP: $VAULT_IP"
+              echo "DynamoDB Table: $TABLE_NAME"
+
+              echo "##vso[task.setvariable variable=VAULT_IP]$VAULT_IP"
+              echo "##vso[task.setvariable variable=VAULT_TABLE]$TABLE_NAME"
+            displayName: "Get Vault Details"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
+
+          # 2) Check Status & Reset if needed
+          - script: |
+              set -euo pipefail
+
+              export VAULT_ADDR="http://$(VAULT_IP):8200"
+
+              echo "Checking Vault status at $VAULT_ADDR..."
+
+              # Install jq if missing
+              if ! command -v jq &> /dev/null; then
+                  sudo apt-get update && sudo apt-get install -y jq || true
+              fi
+
+              # Check status
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$VAULT_ADDR/v1/sys/health" || true)
+              echo "Vault Health HTTP Code: $HTTP_CODE"
+
+              # 200 = Initialized, Unsealed, Active
+              # 429 = Initialized, Unsealed, Standby
+              # 501 = Not Initialized
+              # 503 = Sealed
+
+              INITIALIZED="false"
+              if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "429" || "$HTTP_CODE" == "503" ]]; then
+                  INITIALIZED="true"
+              fi
+
+              echo "Vault Initialized: $INITIALIZED"
+
+              # LOGIC: If initialized, we WIPE to get a new token (User Request)
+              # OR we can add a condition. For now, we assume user lost keys and wants a reset.
+
+              if [ "$INITIALIZED" == "true" ]; then
+                  echo "Vault is already initialized."
+                  echo "WARNING: Resetting Vault (Wiping DynamoDB & Rebooting) to generate new Root Token as requested!"
+                  
+                  # 1. Wipe DynamoDB
+                  echo "Scanning and deleting items from $(VAULT_TABLE)..."
+                  # Note: Scan is slow for large tables, but this is a dev/test vault.
+                  aws dynamodb scan --table-name "$(VAULT_TABLE)" --attributes-to-get "Path" "Key" \
+                      | jq -r '.Items[] | .Path.S + " " + (.Key.S // "")' \
+                      | while read -r p k; do
+                          KEY_JSON="{\"Path\": {\"S\": \"$p\"}, \"Key\": {\"S\": \"$k\"}}"
+                          aws dynamodb delete-item --table-name "$(VAULT_TABLE)" --key "$KEY_JSON"
+                      done
+                  
+                  echo "DynamoDB table wiped."
+                  
+                  # 2. Reboot Instance to restart Vault service (easiest way without SSH)
+                  aws configure set region $(awsRegion)
+                  INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=ip-address,Values=$(VAULT_IP)" --query "Reservations[0].Instances[0].InstanceId" --output text)
+                  
+                  echo "Rebooting Vault Instance ($INSTANCE_ID)..."
+                  aws ec2 reboot-instances --instance-ids "$INSTANCE_ID"
+                  
+                  echo "Waiting for instance to come back..."
+                  sleep 60
+                  
+                  # Wait for Vault to be responsive (501 Not Initialized)
+                  echo "Waiting for Vault service..."
+                  for i in {1..30}; do
+                      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$VAULT_ADDR/v1/sys/health" || true)
+                      if [[ "$HTTP_CODE" == "501" ]]; then
+                          echo "Vault is up and uninitialized (501)."
+                          break
+                      fi
+                      echo "Waiting... ($HTTP_CODE)"
+                      sleep 10
+                  done
+              fi
+
+              # 3) Initialize Vault
+              echo "Initializing Vault..."
+              # Capture output
+              INIT_OUTPUT=$(curl -s --request POST --data '{"secret_shares": 1, "secret_threshold": 1}' "$VAULT_ADDR/v1/sys/init")
+
+              # Check if successful
+              if echo "$INIT_OUTPUT" | jq -e .root_token > /dev/null; then
+                  ROOT_TOKEN=$(echo "$INIT_OUTPUT" | jq -r .root_token)
+                  UNSEAL_KEY=$(echo "$INIT_OUTPUT" | jq -r .keys_base64[0])
+                  
+                  echo ""
+                  echo "=================================================================="
+                  echo "VAULT INITIALIZED SUCCESSFULLY"
+                  echo "=================================================================="
+                  echo "ROOT TOKEN: $ROOT_TOKEN"
+                  echo "UNSEAL KEY: $UNSEAL_KEY"
+                  echo "=================================================================="
+                  echo ""
+                  echo "##vso[task.setvariable variable=VAULT_ROOT_TOKEN;isOutput=true;issecret=true]$ROOT_TOKEN"
+                  
+                  # 4) Unseal Vault
+                  echo "Unsealing Vault..."
+                  curl -s --request POST --data "{\"key\": \"$UNSEAL_KEY\"}" "$VAULT_ADDR/v1/sys/unseal"
+                  
+              else
+                  echo "Vault initialization failed or already initialized."
+                  echo "Output: $INIT_OUTPUT"
+                  exit 1
+              fi
+
+            displayName: "Reset, Init & Unseal Vault"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
+
+      - job: Vault_Configure
+        displayName: "Configure Vault (Auth, Roles, Secrets)"
+        dependsOn: Vault_Init
+        variables:
+          VAULT_ROOT_TOKEN: $[ dependencies.Vault_Init.outputs['Reset, Init & Unseal Vault.VAULT_ROOT_TOKEN'] ]
+        pool:
+          name: Default
+
+        steps:
+          # 1) Install Ansible
+          - script: |
+              set -euo pipefail
+              if ! command -v ansible-playbook &> /dev/null; then
+                  echo "Ansible not found. Installing via pip..."
+                  python3 -m pip install --user ansible
+                  echo "##vso[task.prependpath]$HOME/.local/bin"
+              else
+                  echo "Ansible is already installed."
+              fi
+
+              # Add ~/.local/bin to PATH for this script execution too
+              export PATH="$HOME/.local/bin:$PATH"
+              ansible-playbook --version
+            displayName: "Install Ansible"
+
+          # 2) Fetch Terraform Outputs (We need cluster info + DB creds)
+          - script: |
+              set -euo pipefail
+
+              # Terraform Init to read state
+              cd terraform
+              echo "Initializing Terraform to read state..."
+              terraform init -input=false -reconfigure -no-color \
+                  -backend-config="bucket=$(tfStateBucket)" \
+                  -backend-config="key=$(tfStateKey)" \
+                  -backend-config="region=$(awsRegion)" >/dev/null
+
+              # Get all needed outputs
+              echo "Fetching Terraform outputs..."
+
+              CLUSTER_NAME=$(terraform output -raw cluster_name)
+              RDS_ENDPOINT=$(terraform output -raw rds_endpoint)
+              REDIS_ENDPOINT=$(terraform output -raw redis_endpoint)
+              DB_PASSWORD=$(terraform output -raw db_password)
+              OIDC_ISSUER=$(terraform output -raw cluster_oidc_issuer_url)
+
+              # Export them for next steps (using Azure DevOps variables)
+              echo "##vso[task.setvariable variable=TF_CLUSTER_NAME]$CLUSTER_NAME"
+              echo "##vso[task.setvariable variable=TF_RDS_ENDPOINT]$RDS_ENDPOINT"
+              echo "##vso[task.setvariable variable=TF_REDIS_ENDPOINT]$REDIS_ENDPOINT"
+              echo "##vso[task.setvariable variable=TF_DB_PASSWORD;issecret=true]$DB_PASSWORD"
+              echo "##vso[task.setvariable variable=TF_OIDC_ISSUER]$OIDC_ISSUER"
+
+              echo "Terraform outputs fetched successfully."
+            displayName: "Fetch Terraform Outputs"
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(awsRegion)
+
+          # 3) Get Vault Public IP (from AWS) + Service Account Token
+          - script: |
+              set -euo pipefail
+
+              # Configure AWS
+              aws configure set aws_access_key_id $(AWS_ACCESS_KEY_ID)
+              aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
+              aws configure set region $(awsRegion)
+
+              # Update Kubeconfig
+              aws eks update-kubeconfig --name "$(TF_CLUSTER_NAME)" --region "$(awsRegion)"
+
+              # Get Vault IP
+              echo "Fetching Vault Public IP..."
+              VAULT_IP=$(aws ec2 describe-instances \
+                --filters "Name=tag:Name,Values=vault-instance" \
+                --query "Reservations[].Instances[].PublicIpAddress" \
+                --output text)
+
+              if [ -z "$VAULT_IP" ] || [ "$VAULT_IP" == "None" ]; then
+                  echo "##vso[task.logissue type=error]Could not find Vault Instance Public IP"
+                  exit 1
+              fi
+              echo "Vault IP: $VAULT_IP"
+              echo "##vso[task.setvariable variable=VAULT_IP]$VAULT_IP"
+
+              # Get Token Reviewer JWT
+              echo "Fetching Vault SA Token..."
+              # Ensure secret exists (created by Vault helm chart/injector usually, or we create one)
+              # The 'vault' release creates a ServiceAccount named 'vault'.
+              # We need a token for the 'vault' SA or the one defined in auth config.
+              # Let's use the default one or one explicitly created for auth delegation.
+              # In K8s 1.24+, secrets are not auto-created.
+
+              # Check if secret exists or create/get token
+              TOKEN_REVIEWER_JWT=$(kubectl get secret vault-auth-token -n vault -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+
+              if [ -z "$TOKEN_REVIEWER_JWT" ]; then
+                  echo "Creating manual secret for vault-auth-token..."
+                  kubectl apply -f - <<EOF
+                  apiVersion: v1
+                  kind: Secret
+                  metadata:
+                    name: vault-auth-token
+                    namespace: vault
+                    annotations:
+                      kubernetes.io/service-account.name: vault
+                  type: kubernetes.io/service-account-token
+              EOF
+                  sleep 2
+                  TOKEN_REVIEWER_JWT=$(kubectl get secret vault-auth-token -n vault -o jsonpath='{.data.token}' | base64 -d)
+              fi
+
+              echo "##vso[task.setvariable variable=TOKEN_REVIEWER_JWT;issecret=true]$TOKEN_REVIEWER_JWT"
+
+            displayName: "Get Vault IP & K8s Token"
+
+          # 4) Run Ansible Playbook to Configure Vault
+          - script: |
+              set -euo pipefail
+
+              echo "Running Ansible Playbook to configure Vault..."
+
+              # Using the passed variable from previous job (mapped in variables block)
+              if [ -z "$(VAULT_ROOT_TOKEN)" ]; then
+                  echo "##vso[task.logissue type=error]VAULT_ROOT_TOKEN variable is missing! Initialization failed?"
+                  exit 1
+              fi
+
+              export VAULT_ADDR="http://$(VAULT_IP):8200"
+              export VAULT_TOKEN="$(VAULT_ROOT_TOKEN)"
+              export K8S_HOST="$(TF_CLUSTER_NAME)"  # Note: logic in previous files used cluster_endpoint, verify if Ansible expects name or URL
+
+              # Actually, Ansible needs K8S_HOST as URL and CA CERT.
+              # Fetched via terraform or kubectl? 
+              # Let's get them from Kubeconfig or Terraform
+
+              # Re-fetch specific K8s details if needed by Ansible vars
+              export K8S_HOST=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+              export K8S_CA_CERT=$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d)
+              export K8S_OIDC_ISSUER="$(TF_OIDC_ISSUER)"
+
+              export TOKEN_REVIEWER_JWT="$(TOKEN_REVIEWER_JWT)"
+              export DB_PASSWORD="$(TF_DB_PASSWORD)"
+              export RDS_ENDPOINT="$(TF_RDS_ENDPOINT)"
+              export REDIS_ENDPOINT="$(TF_REDIS_ENDPOINT)"
+              export AWS_REGION="$(awsRegion)"
+
+              # Debug (exclude secrets)
+              echo "VAULT_ADDR=$VAULT_ADDR"
+              echo "K8S_HOST=$K8S_HOST"
+              echo "RDS_ENDPOINT=$RDS_ENDPOINT"
+
+              ansible-playbook ansible/vault-config.yml
+            displayName: "Run Ansible Vault Config"
