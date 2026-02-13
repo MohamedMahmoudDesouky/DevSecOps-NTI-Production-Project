@@ -69,7 +69,7 @@ resource "aws_iam_policy" "vault_policy" {
           "dynamodb:UpdateItem",
           "dynamodb:Scan"
         ]
-        Resource = "arn:aws:dynamodb:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${aws_dynamodb_table.vault.name}"
+        Resource = "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${aws_dynamodb_table.vault.name}"
       },
       {
         Effect = "Allow"
@@ -118,7 +118,7 @@ resource "aws_dynamodb_table" "vault" {
 
 # Vault EC2 Instance
 resource "aws_instance" "vault" {
-  ami           = "ami-05fb0b8c1424b266b" # Amazon Linux 2023 (us-east-2) - UPDATE IF NEEDED
+  ami           = "ami-05efc83cb5512477c" # Amazon Linux 2023 (us-east-2)
   instance_type = "t3.micro"
   subnet_id     = var.subnet_ids[0]
 
@@ -137,7 +137,7 @@ resource "aws_instance" "vault" {
               # Config Vault
               cat <<EOT > /etc/vault.d/vault.hcl
               storage "dynamodb" {
-                region = "${data.aws_region.current.name}"
+                region = "${data.aws_region.current.id}"
                 table = "${aws_dynamodb_table.vault.name}"
               }
               
