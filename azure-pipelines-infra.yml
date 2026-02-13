@@ -390,11 +390,12 @@ stages:
                   # 1. Wipe DynamoDB
                   echo "Scanning and deleting items from $(VAULT_TABLE)..."
                   # Note: Scan is slow for large tables, but this is a dev/test vault.
-                  aws dynamodb scan --table-name "$(VAULT_TABLE)" --attributes-to-get "Path" "Key" \
-                      | jq -r '.Items[] | .Path.S + " " + (.Key.S // "")' \
-                      | while read -r p k; do
-                          KEY_JSON="{\"Path\": {\"S\": \"$p\"}, \"Key\": {\"S\": \"$k\"}}"
-                          aws dynamodb delete-item --table-name "$(VAULT_TABLE)" --key "$KEY_JSON"
+                  aws dynamodb scan --table-name "$(VAULT_TABLE)" \
+                    --projection-expression "Path, #K" \
+                    --expression-attribute-names '{"#K":"Key"}' \
+                    | jq -c '.Items[]' \
+                    | while read -r item; do
+                        aws dynamodb delete-item --table-name "$(VAULT_TABLE)" --key "$item"
                       done
                   
                   echo "DynamoDB table wiped."
