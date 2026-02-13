@@ -391,8 +391,8 @@ stages:
                   echo "Scanning and deleting items from $(VAULT_TABLE)..."
                   # Note: Scan is slow for large tables, but this is a dev/test vault.
                   aws dynamodb scan --table-name "$(VAULT_TABLE)" \
-                    --projection-expression "Path, #K" \
-                    --expression-attribute-names '{"#K":"Key"}' \
+                    --projection-expression "#P, #K" \
+                    --expression-attribute-names '{"#P":"Path", "#K":"Key"}' \
                     | jq -c '.Items[]' \
                     | while read -r item; do
                         aws dynamodb delete-item --table-name "$(VAULT_TABLE)" --key "$item"
