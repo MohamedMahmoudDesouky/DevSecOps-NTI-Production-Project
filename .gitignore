@@ -59,11 +59,11 @@ build/
 logs/
 
 # Binaries
-kubectl
-helm
-vault
-cosign
-trivy
+/kubectl
+/helm
+/vault
+/cosign
+/trivy
 
 # Temporary files
 *.tmp
