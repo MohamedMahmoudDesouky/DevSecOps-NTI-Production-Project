@@ -68,7 +68,8 @@ resource "aws_iam_policy" "vault_policy" {
           "dynamodb:DeleteItem",
           "dynamodb:UpdateItem",
           "dynamodb:Scan",
-          "dynamodb:Query"
+          "dynamodb:Query",
+          "dynamodb:BatchWriteItem"
         ]
         Resource = "arn:aws:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${aws_dynamodb_table.vault.name}"
       },
