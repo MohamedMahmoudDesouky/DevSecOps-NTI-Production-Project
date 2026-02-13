@@ -280,6 +280,12 @@ stages:
 
           - script: |
               set -euxo pipefail
+              echo "== Dealing with potential Webhook conflicts =="
+              kubectl delete mutatingwebhookconfiguration vault-agent-injector-cfg --ignore-not-found
+            displayName: "Cleanup Conflicting Webhook"
+
+          - script: |
+              set -euxo pipefail
               helm repo add hashicorp https://helm.releases.hashicorp.com
               helm repo update
 
