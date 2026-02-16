@@ -214,3 +214,35 @@ Built a complete migration from static Kubernetes secrets to a dynamic secret ma
 - 🌍 2 Availability Zones
 
 - 🔄 3 Environments (Dev/Staging/Prod)
+
+
+## 📟 List of Key Commands Used
+
+```bash
+# Terraform
+terraform init && terraform apply -auto-approve
+terraform refresh && terraform output -raw vault_public_ip
+
+# Vault Access (SSH Tunnel)
+ssh -i ~/.ssh/id_rsa -L 8200:127.0.0.1:8200 ec2-user@<VAULT_IP> -N -f
+
+# Vault Configuration (Local CLI)
+export VAULT_ADDR="http://127.0.0.1:8200"
+vault secrets enable -path=secret kv-v2
+vault write auth/kubernetes/config kubernetes_host=<EKS_ENDPOINT> ...
+
+# Kubernetes
+./kubectl apply -f k8s/dev/
+./kubectl rollout restart deployment backend -n dev
+./kubectl logs <pod> -c vault-agent-init
+
+# Deployment Scripts
+./build-and-push.sh v1.0.0
+./deploy.sh v1.0.0
+```
+
+## 🧹 Cleanup
+To destroy all resources:
+```bash
+terraform destroy -auto-approve
+```
