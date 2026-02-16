@@ -1,4 +1,4 @@
-# LinkedIn Post - DevSecOps Production Project
+DevSecOps Production Project
 
 
 
